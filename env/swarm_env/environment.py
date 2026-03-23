@@ -22,8 +22,41 @@ from swarm_env.config import (
     DRONE_RADIUS,
     DRONE_SPEED,
     OBSTACLE_POSITIONS,
+    OBSTACLE_REPULSION_RANGE,
+    OBSTACLE_REPULSION_STRENGTH,
     DT,
 )
+
+
+def _obstacle_repulsion(
+    position: pygame.math.Vector2,
+    obstacles: list,
+) -> pygame.math.Vector2:
+    """Return repulsion velocity (1/distance) from nearby obstacles."""
+    total = pygame.math.Vector2(0, 0)
+    px, py = position.x, position.y
+
+    for obs in obstacles:
+        rect = obs.get_collision_rect()
+        closest_x = max(rect.left, min(rect.right, px))
+        closest_y = max(rect.top, min(rect.bottom, py))
+        dx = px - closest_x
+        dy = py - closest_y
+        dist_sq = dx * dx + dy * dy
+        dist = math.sqrt(dist_sq)
+
+        if dist <= 0 or dist > OBSTACLE_REPULSION_RANGE:
+            continue
+
+        # 1/distance falloff; clamp min dist to avoid explosion when very close
+        safe_dist = max(dist, 5.0)
+        magnitude = OBSTACLE_REPULSION_STRENGTH / (safe_dist * safe_dist)
+        nx = dx / safe_dist
+        ny = dy / safe_dist
+        total.x += nx * magnitude
+        total.y += ny * magnitude
+
+    return total
 
 
 def _circle_rect_overlap(
@@ -72,12 +105,6 @@ def _push_circle_out_of_rect(
     ny = dy / dist
     normal = pygame.math.Vector2(nx, ny)
     return (center + normal * overlap, normal)
-
-
-def _reflect_velocity(velocity: pygame.math.Vector2, normal: pygame.math.Vector2) -> pygame.math.Vector2:
-    """Reflect velocity across surface with given outward normal."""
-    dot = velocity.x * normal.x + velocity.y * normal.y
-    return velocity - 2 * dot * normal
 
 
 def _circle_circle_overlap(
@@ -143,6 +170,7 @@ class Environment:
         self._seed = seed
         self._width = width
         self._height = height
+        self._step_count = 0
         self.reset(seed=seed)
 
     def reset(self, seed: int | None = None) -> tuple[dict[int, dict], dict[str, Any]]:
@@ -152,6 +180,7 @@ class Environment:
         """
         if seed is not None:
             random.seed(seed)
+        self._step_count = 0
         self.obstacles.clear()
         self.drones.clear()
         self._init_obstacles()
@@ -195,28 +224,47 @@ class Environment:
             if overlap:
                 attempts += 1
                 continue
-            vx = random.uniform(-DRONE_SPEED, DRONE_SPEED)
-            vy = random.uniform(-DRONE_SPEED, DRONE_SPEED)
-            self.drones.append(Drone(x, y, radius=DRONE_RADIUS, vx=vx, vy=vy))
+            # Random initial thrust and steer for demo mode (forward only)
+            thrust = random.uniform(0.5, 1.0)
+            steer = random.uniform(-0.5, 0.5)
+            heading = random.uniform(0, 2 * math.pi)
+            vx = thrust * DRONE_SPEED * math.cos(heading)
+            vy = thrust * DRONE_SPEED * math.sin(heading)
+            drone = Drone(x, y, radius=DRONE_RADIUS, vx=vx, vy=vy)
+            drone.thrust = thrust
+            drone.steer = steer
+            drone.heading = heading
+            self.drones.append(drone)
             attempts = 0
 
     def _apply_actions(self, actions: dict[int, tuple[float, float]] | None) -> None:
-        """Apply actions to drone velocities. Missing agents keep current velocity."""
+        """Apply helicopter-style actions: (thrust, steer). thrust in [-1,1], steer in [-1,1]. Missing agents keep current."""
         if actions is None:
             return
-        for agent_id, (vx, vy) in actions.items():
+        for agent_id, (thrust, steer) in actions.items():
             if 0 <= agent_id < len(self.drones):
-                self.drones[agent_id].velocity = pygame.math.Vector2(vx, vy)
+                d = self.drones[agent_id]
+                d.thrust = max(0.0, min(1.0, thrust))  # forward only
+                d.steer = max(-1.0, min(1.0, steer))
 
     def _physics_step(self) -> None:
         """Apply movement and collision. Environment logic only; drones are passive."""
         for drone in self.drones:
             drone.update(self.dt)
 
+        # Obstacle repulsion (soft push away, 1/distance)
         for drone in self.drones:
-            drone.position, drone.velocity = self.arena.clamp_and_bounce(
-                drone.position, drone.velocity, drone.radius
-            )
+            repulsion = _obstacle_repulsion(drone.position, self.obstacles)
+            drone.velocity += repulsion
+            # Cap speed so repulsion doesn't launch drones
+            if drone.velocity.length_squared() > DRONE_SPEED * DRONE_SPEED:
+                drone.velocity.scale_to_length(DRONE_SPEED)
+
+        for drone in self.drones:
+            clamped = self.arena.clamp(drone.position, drone.radius)
+            if clamped.x != drone.position.x or clamped.y != drone.position.y:
+                drone.velocity = pygame.math.Vector2(0, 0)
+            drone.position = clamped
 
         for drone in self.drones:
             for obs in self.obstacles:
@@ -229,8 +277,7 @@ class Environment:
                         drone.position, drone.radius, obs.get_collision_rect()
                     )
                     drone.position = new_pos
-                    if normal is not None:
-                        drone.velocity = _reflect_velocity(drone.velocity, normal)
+                    drone.velocity = pygame.math.Vector2(0, 0)
 
         for i in range(len(self.drones)):
             for j in range(i + 1, len(self.drones)):
@@ -242,15 +289,8 @@ class Environment:
                     )
                     d1.position = p1
                     d2.position = p2
-                    dx = d2.position.x - d1.position.x
-                    dy = d2.position.y - d1.position.y
-                    dist_sq = dx * dx + dy * dy
-                    if dist_sq > 0:
-                        dist = math.sqrt(dist_sq)
-                        n1 = pygame.math.Vector2(-dx / dist, -dy / dist)
-                        n2 = pygame.math.Vector2(dx / dist, dy / dist)
-                        d1.velocity = _reflect_velocity(d1.velocity, n1)
-                        d2.velocity = _reflect_velocity(d2.velocity, n2)
+                    d1.velocity = pygame.math.Vector2(0, 0)
+                    d2.velocity = pygame.math.Vector2(0, 0)
 
     def _compute_observations(self) -> dict[int, dict]:
         """Compute local observations for all agents using neighbor finder."""
@@ -318,9 +358,31 @@ class Environment:
         """
         Step environment. Returns (observations, rewards, terminations, truncations, infos).
 
-        actions: agent_id -> (vx, vy). If None or agent missing, keep current velocity.
+        actions: agent_id -> (thrust, steer). Helicopter-style:
+          thrust in [-1, 1]: -1=backward, 0=no forward/back, 1=forward
+          steer in [-1, 1]: -1=turn left, 0=no turn, 1=turn right
+        Thrust+steer = curved path. Steer only = spin in place.
+        If None, use random thrust/steer (demo mode). If agent missing, keep current.
         Compatible with PettingZoo parallel API.
         """
+        if actions is None:
+            # Change direction every ~0.5 s so drones wander instead of jitter
+            # Thrust always has meaningful magnitude to avoid "stop and spin" (thrust≈0 + steer high)
+            if self._step_count % 30 == 0:
+                actions = {}
+                for i in range(len(self.drones)):
+                    thrust = random.uniform(0.4, 1.0)  # forward only (no backward)
+                    steer = random.uniform(-0.7, 0.7)
+                    actions[i] = (thrust, steer)
+                self._random_actions = actions
+            else:
+                actions = getattr(self, "_random_actions", None)
+                if actions is None:
+                    actions = {
+                        i: (random.uniform(0.4, 1.0), random.uniform(-0.7, 0.7))
+                        for i in range(len(self.drones))
+                    }
+            self._step_count += 1
         self._apply_actions(actions)
         self._physics_step()
         observations = self._compute_observations()
