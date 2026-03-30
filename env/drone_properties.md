@@ -124,8 +124,7 @@ Each observation is a dict with **local-only** info (within `perception_range`):
 | FPS / dt | 60 / 0.0167 s |
 
 ---
-
-## 8. Notes for RL Team
+## 8. Notes
 
 - **Partial actions:** Omitted agents keep their previous thrust/steer
 - **Rewards:** Currently all 0 (define your own)

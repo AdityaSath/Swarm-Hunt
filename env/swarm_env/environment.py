@@ -1,80 +1,95 @@
 """
-Main swarm environment. RL-ready: reset, step(actions), observation-based updates.
+V1 pursuit environment core.
 
-Environment logic is separate from drone logic. Drones are state containers;
-the environment applies actions, physics, and provides observations via local neighbor lookup.
+Integer-indexed internal API — no PettingZoo / Gymnasium dependency.
+The thin PettingZoo wrapper lives in ``parallel_env.py``.
+
+Step order:
+    1. Apply predator desired velocities
+    2. Scripted prey policy
+    3. Physics (walls, obstacles, collisions)
+    4. Capture geometry + tactical FSM
+    5. Rewards
+    6. Observations
 """
+
+from __future__ import annotations
 
 import math
 import random
 from typing import Any
 
+import numpy as np
 import pygame
 
 from swarm_env.arena import Arena
 from swarm_env.obstacle import Obstacle
 from swarm_env.drone import Drone
-from swarm_env.spatial import DistanceBasedNeighborFinder, NeighborFinder
+from swarm_env.prey import Prey
+from swarm_env.capture import (
+    compute_escape_gap,
+    GapResult,
+    TacticalFSM,
+    PreyTacticalState,
+    EpisodeState,
+)
 from swarm_env.config import (
     ARENA_WIDTH,
     ARENA_HEIGHT,
     DRONE_COUNT,
     DRONE_RADIUS,
     DRONE_SPEED,
+    PREY_RADIUS,
     OBSTACLE_POSITIONS,
-    OBSTACLE_REPULSION_RANGE,
-    OBSTACLE_REPULSION_STRENGTH,
     DT,
+    MAX_STEPS,
+    R_SENSE,
+    K_TEAMMATES,
+    M_OBSTACLES,
+    WORLD_SCALE,
+    REWARD_CAPTURE,
+    REWARD_TIMEOUT,
+    REWARD_THREATENED,
+    REWARD_CONTAINED,
+    REWARD_CONTAINMENT_STEP,
+    REWARD_ESCAPE,
+    PENALTY_OBSTACLE_COLLISION,
+    PENALTY_PREDATOR_COLLISION,
+    PENALTY_IDLE,
+    IDLE_SPEED_THRESHOLD,
+    DIST_SHAPING_CLIP,
+    CONTRIBUTOR_BONUS,
+    CONTRIBUTOR_BONUS_ENABLED,
 )
 
-
-def _obstacle_repulsion(
-    position: pygame.math.Vector2,
-    obstacles: list,
-) -> pygame.math.Vector2:
-    """Return repulsion velocity (1/distance) from nearby obstacles."""
-    total = pygame.math.Vector2(0, 0)
-    px, py = position.x, position.y
-
-    for obs in obstacles:
-        rect = obs.get_collision_rect()
-        closest_x = max(rect.left, min(rect.right, px))
-        closest_y = max(rect.top, min(rect.bottom, py))
-        dx = px - closest_x
-        dy = py - closest_y
-        dist_sq = dx * dx + dy * dy
-        dist = math.sqrt(dist_sq)
-
-        if dist <= 0 or dist > OBSTACLE_REPULSION_RANGE:
-            continue
-
-        # 1/distance falloff; clamp min dist to avoid explosion when very close
-        safe_dist = max(dist, 5.0)
-        magnitude = OBSTACLE_REPULSION_STRENGTH / (safe_dist * safe_dist)
-        nx = dx / safe_dist
-        ny = dy / safe_dist
-        total.x += nx * magnitude
-        total.y += ny * magnitude
-
-    return total
+# Per-predator observation size:
+#   self: pos(2) + vel(2) = 4
+#   prey: visible(1) + rel_pos(2) + rel_vel(2) + dist(1) = 6
+#   K teammates: each valid(1) + rel_pos(2) + rel_vel(2) + dist(1) = 6  → K*6
+#   M obstacles: each valid(1) + rel_pos(2) + char_radius(1) + dist(1) = 5  → M*5
+#   borders: left, right, top, bottom = 4
+OBS_SELF = 4
+OBS_PREY = 6
+OBS_TEAMMATE_SLOT = 6
+OBS_OBSTACLE_SLOT = 5
+OBS_BORDER = 4
+OBS_SIZE = OBS_SELF + OBS_PREY + K_TEAMMATES * OBS_TEAMMATE_SLOT + M_OBSTACLES * OBS_OBSTACLE_SLOT + OBS_BORDER
 
 
-def _circle_rect_overlap(
-    center: tuple[float, float], radius: float, rect: pygame.Rect
-) -> bool:
-    """Check if circle overlaps rect."""
-    cx, cy = center
+# ── collision helpers (pure functions) ────────────────────────────────────
+
+def _circle_rect_overlap(cx: float, cy: float, r: float, rect: pygame.Rect) -> bool:
     closest_x = max(rect.left, min(rect.right, cx))
     closest_y = max(rect.top, min(rect.bottom, cy))
     dx = cx - closest_x
     dy = cy - closest_y
-    return dx * dx + dy * dy < radius * radius
+    return dx * dx + dy * dy < r * r
 
 
 def _push_circle_out_of_rect(
     center: pygame.math.Vector2, radius: float, rect: pygame.Rect
-) -> tuple[pygame.math.Vector2, pygame.math.Vector2 | None]:
-    """Push circle center out of rect. Returns (new_position, collision_normal or None)."""
+) -> tuple[pygame.math.Vector2, bool]:
+    """Push circle out of rect. Returns (new_pos, collided)."""
     cx, cy = center.x, center.y
     closest_x = max(rect.left, min(rect.right, cx))
     closest_y = max(rect.top, min(rect.bottom, cy))
@@ -83,7 +98,7 @@ def _push_circle_out_of_rect(
     dist_sq = dx * dx + dy * dy
 
     if dist_sq >= radius * radius:
-        return (center, None)
+        return center, False
 
     if dist_sq == 0:
         to_left = cx - rect.left
@@ -92,62 +107,57 @@ def _push_circle_out_of_rect(
         to_bottom = rect.bottom - cy
         min_dist = min(to_left, to_right, to_top, to_bottom)
         if min_dist == to_left:
-            return (pygame.math.Vector2(rect.left - radius, cy), pygame.math.Vector2(1, 0))
+            return pygame.math.Vector2(rect.left - radius, cy), True
         if min_dist == to_right:
-            return (pygame.math.Vector2(rect.right + radius, cy), pygame.math.Vector2(-1, 0))
+            return pygame.math.Vector2(rect.right + radius, cy), True
         if min_dist == to_top:
-            return (pygame.math.Vector2(cx, rect.top - radius), pygame.math.Vector2(0, 1))
-        return (pygame.math.Vector2(cx, rect.bottom + radius), pygame.math.Vector2(0, -1))
+            return pygame.math.Vector2(cx, rect.top - radius), True
+        return pygame.math.Vector2(cx, rect.bottom + radius), True
 
     dist = math.sqrt(dist_sq)
     overlap = radius - dist
     nx = dx / dist
     ny = dy / dist
-    normal = pygame.math.Vector2(nx, ny)
-    return (center + normal * overlap, normal)
-
-
-def _circle_circle_overlap(
-    c1: tuple[float, float], r1: float, c2: tuple[float, float], r2: float
-) -> bool:
-    dx = c1[0] - c2[0]
-    dy = c1[1] - c2[1]
-    return dx * dx + dy * dy < (r1 + r2) ** 2
+    return center + pygame.math.Vector2(nx * overlap, ny * overlap), True
 
 
 def _push_circles_apart(
-    pos1: pygame.math.Vector2,
-    r1: float,
-    pos2: pygame.math.Vector2,
-    r2: float,
-) -> tuple[pygame.math.Vector2, pygame.math.Vector2]:
+    pos1: pygame.math.Vector2, r1: float,
+    pos2: pygame.math.Vector2, r2: float,
+) -> tuple[pygame.math.Vector2, pygame.math.Vector2, bool]:
+    """Push two circles apart. Returns (new_p1, new_p2, collided)."""
     dx = pos2.x - pos1.x
     dy = pos2.y - pos1.y
     dist_sq = dx * dx + dy * dy
+    combined = r1 + r2
+    if dist_sq >= combined * combined:
+        return pos1, pos2, False
     if dist_sq == 0:
-        pos1 = pos1 + pygame.math.Vector2(r1, 0)
-        pos2 = pos2 + pygame.math.Vector2(-r2, 0)
-        return (pos1, pos2)
+        return (
+            pos1 + pygame.math.Vector2(r1, 0),
+            pos2 + pygame.math.Vector2(-r2, 0),
+            True,
+        )
     dist = math.sqrt(dist_sq)
-    overlap = r1 + r2 - dist
-    if overlap <= 0:
-        return (pos1, pos2)
+    overlap = combined - dist
     nx = dx / dist
     ny = dy / dist
     half = overlap / 2
-    pos1 = pos1 - pygame.math.Vector2(nx * half, ny * half)
-    pos2 = pos2 + pygame.math.Vector2(nx * half, ny * half)
-    return (pos1, pos2)
+    return (
+        pos1 - pygame.math.Vector2(nx * half, ny * half),
+        pos2 + pygame.math.Vector2(nx * half, ny * half),
+        True,
+    )
 
+
+# ── environment ───────────────────────────────────────────────────────────
 
 class Environment:
     """
-    RL-ready swarm environment. Separate environment logic from drone logic.
+    V1 pursuit environment.  All public API uses **integer** agent indices.
 
-    API:
-        reset(seed) -> observations, infos
-        step(actions) -> observations, rewards, terminations, truncations, infos
-        get_observation(agent_id) -> local observation (uses neighbor finder)
+    ``reset()`` → (observations, infos)
+    ``step(actions)`` → (observations, rewards, terminations, truncations, infos)
     """
 
     def __init__(
@@ -157,248 +167,418 @@ class Environment:
         drone_count: int = DRONE_COUNT,
         dt: float = DT,
         seed: int | None = None,
-        neighbor_finder: NeighborFinder | None = None,
     ):
-        if seed is not None:
-            random.seed(seed)
         self.dt = dt
-        self.arena = Arena(width, height)
-        self.neighbor_finder = neighbor_finder or DistanceBasedNeighborFinder()
-        self.obstacles: list[Obstacle] = []
-        self.drones: list[Drone] = []
-        self._drone_count = drone_count
-        self._seed = seed
         self._width = width
         self._height = height
+        self._drone_count = drone_count
+        self.arena = Arena(width, height)
+
+        self.obstacles: list[Obstacle] = []
+        self.drones: list[Drone] = []
+        self.prey: Prey | None = None
+
+        self._fsm = TacticalFSM()
+        self._episode_state = EpisodeState.IN_PURSUIT
         self._step_count = 0
+
+        # reward bookkeeping
+        self._prev_mean_dist: float = 0.0
+        self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
+
+        # per-step collision flags (set during physics, consumed by rewards)
+        self._obs_collisions: list[bool] = []
+        self._pred_collisions: list[bool] = []
+
+        # demo-mode wandering: persist random velocities across frames
+        self._demo_actions: dict[int, tuple[float, float]] = {}
+        self._demo_change_interval = 60  # re-pick direction every N steps (~1 s at 60 FPS)
+
         self.reset(seed=seed)
 
-    def reset(self, seed: int | None = None) -> tuple[dict[int, dict], dict[str, Any]]:
-        """
-        Reset environment. Returns (observations, infos).
-        Compatible with PettingZoo-style reset.
-        """
+    # ── reset ─────────────────────────────────────────────────────────────
+
+    def reset(self, seed: int | None = None) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
         if seed is not None:
             random.seed(seed)
         self._step_count = 0
+        self._episode_state = EpisodeState.IN_PURSUIT
+        self._fsm.reset()
         self.obstacles.clear()
         self.drones.clear()
+        self.prey = None
         self._init_obstacles()
-        self._init_drones(self._drone_count)
+        self._init_drones()
+        self._init_prey()
+
+        self._prev_mean_dist = self._mean_pred_prey_dist()
+        self._prev_tactical = PreyTacticalState.FREE
+        self._obs_collisions = [False] * self._drone_count
+        self._pred_collisions = [False] * self._drone_count
+
         observations = self._compute_observations()
-        infos = {"agents": list(range(len(self.drones)))}
+        infos: dict[str, Any] = {"episode_state": self._episode_state, "tactical_state": self._fsm.state}
         return observations, infos
 
-    def _init_obstacles(self) -> None:
-        for x, y, size_type in OBSTACLE_POSITIONS:
-            self.obstacles.append(Obstacle(x, y, size_type))
+    # ── step ──────────────────────────────────────────────────────────────
 
-    def _is_valid_spawn(self, x: float, y: float, margin: float) -> bool:
-        if x - margin < 0 or x + margin > self.arena.width:
-            return False
-        if y - margin < 0 or y + margin > self.arena.height:
-            return False
-        test_rect = pygame.Rect(x - margin, y - margin, 2 * margin, 2 * margin)
-        for obs in self.obstacles:
-            if test_rect.colliderect(obs.rect):
-                return False
-        return True
+    def step(
+        self,
+        actions: dict[int, tuple[float, float]] | None = None,
+    ) -> tuple[
+        dict[int, np.ndarray],
+        dict[int, float],
+        dict[int, bool],
+        dict[int, bool],
+        dict[str, Any],
+    ]:
+        n = len(self.drones)
+        self._step_count += 1
 
-    def _init_drones(self, count: int) -> None:
-        margin = DRONE_RADIUS * 2.5
-        attempts = 0
-        max_attempts = count * 100
-        while len(self.drones) < count and attempts < max_attempts:
-            x = random.uniform(margin, self.arena.width - margin)
-            y = random.uniform(margin, self.arena.height - margin)
-            if not self._is_valid_spawn(x, y, margin):
-                attempts += 1
-                continue
-            overlap = False
-            for d in self.drones:
-                dx = x - d.position.x
-                dy = y - d.position.y
-                if dx * dx + dy * dy < (2 * margin) ** 2:
-                    overlap = True
-                    break
-            if overlap:
-                attempts += 1
-                continue
-            # Random initial thrust and steer for demo mode (forward only)
-            thrust = random.uniform(0.5, 1.0)
-            steer = random.uniform(-0.5, 0.5)
-            heading = random.uniform(0, 2 * math.pi)
-            vx = thrust * DRONE_SPEED * math.cos(heading)
-            vy = thrust * DRONE_SPEED * math.sin(heading)
-            drone = Drone(x, y, radius=DRONE_RADIUS, vx=vx, vy=vy)
-            drone.thrust = thrust
-            drone.steer = steer
-            drone.heading = heading
-            self.drones.append(drone)
-            attempts = 0
+        # 1. apply predator desired velocities
+        self._apply_actions(actions)
+
+        # 2. scripted prey policy
+        if self.prey is not None:
+            pred_pos = [(d.position.x, d.position.y) for d in self.drones]
+            obs_rects = [o.get_collision_rect() for o in self.obstacles]
+            self.prey.decide(pred_pos, obs_rects, self._width, self._height)
+
+        # 3. physics
+        self._physics_step()
+
+        # 4. capture / FSM
+        gap, tactical = self._update_capture()
+
+        # 5. rewards
+        rewards = self._compute_rewards(gap, tactical)
+
+        # 6. episode termination / truncation
+        terminations = {i: False for i in range(n)}
+        truncations = {i: False for i in range(n)}
+
+        if tactical == PreyTacticalState.CAPTURED:
+            self._episode_state = EpisodeState.CAPTURED
+            for i in range(n):
+                terminations[i] = True
+        elif self._step_count >= MAX_STEPS:
+            self._episode_state = EpisodeState.TIMEOUT
+            for i in range(n):
+                truncations[i] = True
+
+        # 7. observations
+        observations = self._compute_observations()
+
+        infos: dict[str, Any] = {
+            "episode_state": self._episode_state,
+            "tactical_state": tactical,
+            "step": self._step_count,
+            "gap": gap,
+        }
+
+        self._prev_tactical = tactical
+
+        return observations, rewards, terminations, truncations, infos
+
+    # ── action application ────────────────────────────────────────────────
 
     def _apply_actions(self, actions: dict[int, tuple[float, float]] | None) -> None:
-        """Apply helicopter-style actions: (thrust, steer). thrust in [-1,1], steer in [-1,1]. Missing agents keep current."""
         if actions is None:
+            # demo wandering: pick a new random direction every N steps,
+            # otherwise keep the previous velocity so drones travel smoothly.
+            if self._step_count % self._demo_change_interval == 1 or not self._demo_actions:
+                self._demo_actions = {}
+                for i in range(len(self.drones)):
+                    angle = random.uniform(-math.pi, math.pi)
+                    speed = random.uniform(0.3, 0.7) * DRONE_SPEED
+                    self._demo_actions[i] = (
+                        speed * math.cos(angle),
+                        speed * math.sin(angle),
+                    )
+            for i, d in enumerate(self.drones):
+                vx, vy = self._demo_actions[i]
+                d.set_desired_velocity(vx, vy)
             return
-        for agent_id, (thrust, steer) in actions.items():
+        for agent_id, (vx, vy) in actions.items():
             if 0 <= agent_id < len(self.drones):
-                d = self.drones[agent_id]
-                d.thrust = max(0.0, min(1.0, thrust))  # forward only
-                d.steer = max(-1.0, min(1.0, steer))
+                self.drones[agent_id].set_desired_velocity(vx, vy)
+
+    # ── physics ───────────────────────────────────────────────────────────
 
     def _physics_step(self) -> None:
-        """Apply movement and collision. Environment logic only; drones are passive."""
-        for drone in self.drones:
-            drone.update(self.dt)
+        self._obs_collisions = [False] * len(self.drones)
+        self._pred_collisions = [False] * len(self.drones)
 
-        # Obstacle repulsion (soft push away, 1/distance)
+        # integrate predators
         for drone in self.drones:
-            repulsion = _obstacle_repulsion(drone.position, self.obstacles)
-            drone.velocity += repulsion
-            # Cap speed so repulsion doesn't launch drones
-            if drone.velocity.length_squared() > DRONE_SPEED * DRONE_SPEED:
-                drone.velocity.scale_to_length(DRONE_SPEED)
+            drone.integrate(self.dt)
 
+        # predator–wall clamp
         for drone in self.drones:
             clamped = self.arena.clamp(drone.position, drone.radius)
             if clamped.x != drone.position.x or clamped.y != drone.position.y:
                 drone.velocity = pygame.math.Vector2(0, 0)
             drone.position = clamped
 
-        for drone in self.drones:
+        # predator–obstacle hard collision
+        for idx, drone in enumerate(self.drones):
             for obs in self.obstacles:
-                if _circle_rect_overlap(
-                    (drone.position.x, drone.position.y),
-                    drone.radius,
-                    obs.get_collision_rect(),
-                ):
-                    new_pos, normal = _push_circle_out_of_rect(
-                        drone.position, drone.radius, obs.get_collision_rect()
-                    )
+                new_pos, hit = _push_circle_out_of_rect(
+                    drone.position, drone.radius, obs.get_collision_rect(),
+                )
+                if hit:
                     drone.position = new_pos
                     drone.velocity = pygame.math.Vector2(0, 0)
+                    self._obs_collisions[idx] = True
 
+        # predator–predator collision
         for i in range(len(self.drones)):
             for j in range(i + 1, len(self.drones)):
                 d1, d2 = self.drones[i], self.drones[j]
-                (c1, r1), (c2, r2) = d1.get_collision_circle(), d2.get_collision_circle()
-                if _circle_circle_overlap(c1, r1, c2, r2):
-                    p1, p2 = _push_circles_apart(
-                        d1.position, r1, d2.position, r2
-                    )
+                p1, p2, hit = _push_circles_apart(
+                    d1.position, d1.radius, d2.position, d2.radius,
+                )
+                if hit:
                     d1.position = p1
                     d2.position = p2
                     d1.velocity = pygame.math.Vector2(0, 0)
                     d2.velocity = pygame.math.Vector2(0, 0)
+                    self._pred_collisions[i] = True
+                    self._pred_collisions[j] = True
 
-    def _compute_observations(self) -> dict[int, dict]:
-        """Compute local observations for all agents using neighbor finder."""
-        positions = [(d.position.x, d.position.y) for d in self.drones]
-        obstacle_rects = [obs.get_collision_rect() for obs in self.obstacles]
-        perception_range = self.drones[0].perception_range if self.drones else 0
+        # prey integration (ignores obstacles, clip to arena only)
+        if self.prey is not None:
+            self.prey.integrate(self.dt)
+            clamped = self.arena.clamp(self.prey.position, self.prey.radius)
+            if clamped.x != self.prey.position.x or clamped.y != self.prey.position.y:
+                self.prey.velocity = pygame.math.Vector2(0, 0)
+            self.prey.position = clamped
 
-        drone_neighbors = self.neighbor_finder.find_drone_neighbors(
-            positions, perception_range, exclude_self=True
-        )
-        obstacle_neighbors = self.neighbor_finder.find_nearby_obstacles(
-            positions, obstacle_rects, perception_range
-        )
+    # ── capture / FSM ─────────────────────────────────────────────────────
 
+    def _update_capture(self) -> tuple[GapResult, PreyTacticalState]:
+        if self.prey is None:
+            dummy = GapResult(2 * math.pi, 0.0, 0, [], 0)
+            return dummy, PreyTacticalState.FREE
+
+        px, py = self.prey.position.x, self.prey.position.y
+        pred_pos = [(d.position.x, d.position.y) for d in self.drones]
+        gap = compute_escape_gap(px, py, pred_pos, self._width, self._height)
+        tactical = self._fsm.update(gap, pred_pos, px, py)
+        return gap, tactical
+
+    # ── rewards ───────────────────────────────────────────────────────────
+
+    def _compute_rewards(self, gap: GapResult, tactical: PreyTacticalState) -> dict[int, float]:
+        n = len(self.drones)
+        shared = 0.0
+
+        # terminal
+        if tactical == PreyTacticalState.CAPTURED:
+            shared += REWARD_CAPTURE
+        elif self._step_count >= MAX_STEPS:
+            shared += REWARD_TIMEOUT
+
+        # tactical transitions
+        prev = self._prev_tactical
+        if prev == PreyTacticalState.FREE and tactical == PreyTacticalState.THREATENED:
+            shared += REWARD_THREATENED
+        if prev == PreyTacticalState.THREATENED and tactical == PreyTacticalState.CONTAINED:
+            shared += REWARD_CONTAINED
+        if (
+            prev in (PreyTacticalState.CONTAINED, PreyTacticalState.THREATENED)
+            and tactical == PreyTacticalState.FREE
+        ):
+            shared += REWARD_ESCAPE
+
+        # containment maintenance
+        if tactical == PreyTacticalState.CONTAINED:
+            shared += REWARD_CONTAINMENT_STEP
+
+        # distance shaping (clipped)
+        mean_dist = self._mean_pred_prey_dist()
+        delta = self._prev_mean_dist - mean_dist  # positive = got closer
+        shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, delta / WORLD_SCALE))
+        self._prev_mean_dist = mean_dist
+
+        # penalties (shared)
+        for i in range(n):
+            if self._obs_collisions[i]:
+                shared += PENALTY_OBSTACLE_COLLISION / n
+            if self._pred_collisions[i]:
+                shared += PENALTY_PREDATOR_COLLISION / n
+
+        # idle penalty
+        for d in self.drones:
+            if d.velocity.length() < IDLE_SPEED_THRESHOLD:
+                shared += PENALTY_IDLE / n
+
+        rewards = {i: shared for i in range(n)}
+
+        # optional per-agent contributor bonus
+        if CONTRIBUTOR_BONUS_ENABLED:
+            for idx in gap.contributor_indices:
+                if 0 <= idx < n:
+                    rewards[idx] += CONTRIBUTOR_BONUS
+
+        return rewards
+
+    def _mean_pred_prey_dist(self) -> float:
+        if self.prey is None or not self.drones:
+            return 0.0
+        px, py = self.prey.position.x, self.prey.position.y
+        total = sum(math.hypot(d.position.x - px, d.position.y - py) for d in self.drones)
+        return total / len(self.drones)
+
+    # ── observations ──────────────────────────────────────────────────────
+
+    def _compute_observations(self) -> dict[int, np.ndarray]:
+        observations: dict[int, np.ndarray] = {}
         x_min, y_min, x_max, y_max = self.arena.get_bounds()
-        observations: dict[int, dict] = {}
+        obs_rects = [o.get_collision_rect() for o in self.obstacles]
+
         for i, drone in enumerate(self.drones):
+            obs = np.zeros(OBS_SIZE, dtype=np.float32)
+            offset = 0
             px, py = drone.position.x, drone.position.y
-            neighbors = []
-            for j in drone_neighbors[i]:
-                d = self.drones[j]
-                dx = d.position.x - px
-                dy = d.position.y - py
-                dist = math.sqrt(dx * dx + dy * dy)
-                neighbors.append({
-                    "relative_pos": (dx, dy),
-                    "distance": dist,
-                    "velocity": (d.velocity.x, d.velocity.y),
-                    "id": j,
-                })
-            obstacles = []
-            for oi, dist, rel in obstacle_neighbors[i]:
-                obstacles.append({
-                    "relative_pos": rel,
-                    "distance": dist,
-                    "rect": obstacle_rects[oi],
-                })
-            observations[i] = {
-                "obstacles": obstacles,
-                "neighbors": neighbors,
-                "boundaries": {
-                    "left": px - x_min,
-                    "right": x_max - px,
-                    "top": py - y_min,
-                    "bottom": y_max - py,
-                },
-                "self_state": {
-                    "position": (px, py),
-                    "velocity": (drone.velocity.x, drone.velocity.y),
-                    "heading": drone.heading,
-                },
-            }
+
+            # ---- self (4) ----
+            obs[offset] = px / WORLD_SCALE
+            obs[offset + 1] = py / WORLD_SCALE
+            obs[offset + 2] = drone.velocity.x / DRONE_SPEED
+            obs[offset + 3] = drone.velocity.y / DRONE_SPEED
+            offset += OBS_SELF
+
+            # ---- prey (6) ----
+            if self.prey is not None:
+                prx, pry = self.prey.position.x, self.prey.position.y
+                dist_prey = math.hypot(prx - px, pry - py)
+                if dist_prey <= R_SENSE:
+                    obs[offset] = 1.0  # prey_visible
+                    obs[offset + 1] = (prx - px) / WORLD_SCALE
+                    obs[offset + 2] = (pry - py) / WORLD_SCALE
+                    obs[offset + 3] = (self.prey.velocity.x - drone.velocity.x) / DRONE_SPEED
+                    obs[offset + 4] = (self.prey.velocity.y - drone.velocity.y) / DRONE_SPEED
+                    obs[offset + 5] = dist_prey / WORLD_SCALE
+            offset += OBS_PREY
+
+            # ---- K teammates (K * 6) ----
+            teammates: list[tuple[float, int]] = []
+            for j, other in enumerate(self.drones):
+                if j == i:
+                    continue
+                dx = other.position.x - px
+                dy = other.position.y - py
+                d = math.hypot(dx, dy)
+                if d <= R_SENSE:
+                    teammates.append((d, j))
+            teammates.sort()  # ascending by distance, stable on index
+            for k in range(K_TEAMMATES):
+                slot = offset + k * OBS_TEAMMATE_SLOT
+                if k < len(teammates):
+                    d, j = teammates[k]
+                    other = self.drones[j]
+                    obs[slot] = 1.0  # valid
+                    obs[slot + 1] = (other.position.x - px) / WORLD_SCALE
+                    obs[slot + 2] = (other.position.y - py) / WORLD_SCALE
+                    obs[slot + 3] = (other.velocity.x - drone.velocity.x) / DRONE_SPEED
+                    obs[slot + 4] = (other.velocity.y - drone.velocity.y) / DRONE_SPEED
+                    obs[slot + 5] = d / WORLD_SCALE
+                # else: zeros (already initialized)
+            offset += K_TEAMMATES * OBS_TEAMMATE_SLOT
+
+            # ---- M obstacles (M * 5) ----
+            nearby_obs: list[tuple[float, int]] = []
+            for oi, rect in enumerate(obs_rects):
+                cx = max(rect.left, min(rect.right, px))
+                cy = max(rect.top, min(rect.bottom, py))
+                d = math.hypot(px - cx, py - cy)
+                if d <= R_SENSE:
+                    nearby_obs.append((d, oi))
+            nearby_obs.sort()
+            for m in range(M_OBSTACLES):
+                slot = offset + m * OBS_OBSTACLE_SLOT
+                if m < len(nearby_obs):
+                    d, oi = nearby_obs[m]
+                    rect = obs_rects[oi]
+                    ocx, ocy = rect.centerx, rect.centery
+                    char_r = math.hypot(rect.width, rect.height) / 2
+                    obs[slot] = 1.0  # valid
+                    obs[slot + 1] = (ocx - px) / WORLD_SCALE
+                    obs[slot + 2] = (ocy - py) / WORLD_SCALE
+                    obs[slot + 3] = char_r / WORLD_SCALE
+                    obs[slot + 4] = d / WORLD_SCALE
+            offset += M_OBSTACLES * OBS_OBSTACLE_SLOT
+
+            # ---- borders (4) ----
+            obs[offset] = (px - x_min) / WORLD_SCALE
+            obs[offset + 1] = (x_max - px) / WORLD_SCALE
+            obs[offset + 2] = (py - y_min) / WORLD_SCALE
+            obs[offset + 3] = (y_max - py) / WORLD_SCALE
+
+            observations[i] = obs
+
         return observations
 
-    def step(
-        self,
-        actions: dict[int, tuple[float, float]] | None = None,
-    ) -> tuple[
-        dict[int, dict],
-        dict[int, float],
-        dict[int, bool],
-        dict[int, bool],
-        dict[str, Any],
-    ]:
-        """
-        Step environment. Returns (observations, rewards, terminations, truncations, infos).
+    # ── spawn ─────────────────────────────────────────────────────────────
 
-        actions: agent_id -> (thrust, steer). Helicopter-style:
-          thrust in [-1, 1]: -1=backward, 0=no forward/back, 1=forward
-          steer in [-1, 1]: -1=turn left, 0=no turn, 1=turn right
-        Thrust+steer = curved path. Steer only = spin in place.
-        If None, use random thrust/steer (demo mode). If agent missing, keep current.
-        Compatible with PettingZoo parallel API.
-        """
-        if actions is None:
-            # Change direction every ~0.5 s so drones wander instead of jitter
-            # Thrust always has meaningful magnitude to avoid "stop and spin" (thrust≈0 + steer high)
-            if self._step_count % 30 == 0:
-                actions = {}
-                for i in range(len(self.drones)):
-                    thrust = random.uniform(0.4, 1.0)  # forward only (no backward)
-                    steer = random.uniform(-0.7, 0.7)
-                    actions[i] = (thrust, steer)
-                self._random_actions = actions
-            else:
-                actions = getattr(self, "_random_actions", None)
-                if actions is None:
-                    actions = {
-                        i: (random.uniform(0.4, 1.0), random.uniform(-0.7, 0.7))
-                        for i in range(len(self.drones))
-                    }
-            self._step_count += 1
-        self._apply_actions(actions)
-        self._physics_step()
-        observations = self._compute_observations()
-        n = len(self.drones)
-        rewards = {i: 0.0 for i in range(n)}
-        terminations = {i: False for i in range(n)}
-        truncations = {i: False for i in range(n)}
-        infos = {"agents": list(range(n))}
-        return observations, rewards, terminations, truncations, infos
+    def _init_obstacles(self) -> None:
+        for x, y, size_type in OBSTACLE_POSITIONS:
+            self.obstacles.append(Obstacle(x, y, size_type))
 
-    def get_observation(self, agent_id: int) -> dict | None:
-        """Get local observation for one agent. Uses neighbor finder."""
-        if agent_id < 0 or agent_id >= len(self.drones):
-            return None
-        obs = self._compute_observations()
-        return obs.get(agent_id)
+    def _init_drones(self) -> None:
+        margin = DRONE_RADIUS * 2.5
+        min_pair_dist = DRONE_RADIUS * 4
+        max_attempts = self._drone_count * 200
+        attempts = 0
+        while len(self.drones) < self._drone_count and attempts < max_attempts:
+            x = random.uniform(margin, self._width - margin)
+            y = random.uniform(margin, self._height - margin)
+            if not self._is_valid_spawn(x, y, DRONE_RADIUS):
+                attempts += 1
+                continue
+            too_close = any(
+                math.hypot(x - d.position.x, y - d.position.y) < min_pair_dist
+                for d in self.drones
+            )
+            if too_close:
+                attempts += 1
+                continue
+            self.drones.append(Drone(x, y, radius=DRONE_RADIUS))
+            attempts = 0
+        if len(self.drones) < self._drone_count:
+            raise RuntimeError(
+                f"Could not spawn {self._drone_count} predators without overlap "
+                f"(got {len(self.drones)}). Reduce obstacle density or arena constraints."
+            )
+
+    def _init_prey(self) -> None:
+        margin = PREY_RADIUS
+        max_attempts = 500
+        for _ in range(max_attempts):
+            x = random.uniform(margin, self._width - margin)
+            y = random.uniform(margin, self._height - margin)
+            # prey may spawn on obstacles (it passes through them),
+            # but must not start already captured
+            pred_pos = [(d.position.x, d.position.y) for d in self.drones]
+            gap = compute_escape_gap(x, y, pred_pos, self._width, self._height)
+            if gap.largest_gap >= math.radians(120):
+                self.prey = Prey(x, y, radius=PREY_RADIUS)
+                return
+        # fallback: spawn at arena center
+        self.prey = Prey(self._width / 2, self._height / 2, radius=PREY_RADIUS)
+
+    def _is_valid_spawn(self, x: float, y: float, radius: float) -> bool:
+        if x - radius < 0 or x + radius > self._width:
+            return False
+        if y - radius < 0 or y + radius > self._height:
+            return False
+        for obs in self.obstacles:
+            if _circle_rect_overlap(x, y, radius, obs.get_collision_rect()):
+                return False
+        return True
+
+    # ── rendering ─────────────────────────────────────────────────────────
 
     def render(self, screen: pygame.Surface) -> None:
         self.arena.draw(screen)
@@ -406,39 +586,15 @@ class Environment:
             obs.draw(screen)
         for drone in self.drones:
             drone.draw(screen)
+        if self.prey is not None:
+            self.prey.draw(screen)
 
-    def get_drone_positions(self) -> list[tuple[float, float]]:
-        return [(d.position.x, d.position.y) for d in self.drones]
+    # ── accessors (used by wrapper / tests) ───────────────────────────────
 
-    def get_drone_velocities(self) -> list[tuple[float, float]]:
-        return [(d.velocity.x, d.velocity.y) for d in self.drones]
+    @property
+    def num_agents(self) -> int:
+        return len(self.drones)
 
-    def get_obstacles(self) -> list[pygame.Rect]:
-        return [obs.get_collision_rect() for obs in self.obstacles]
-
-    def get_neighbors(self, drone_id: int, radius: float | None = None) -> list[int]:
-        if drone_id < 0 or drone_id >= len(self.drones):
-            return []
-        drone = self.drones[drone_id]
-        r = radius if radius is not None else drone.perception_range
-        pos = drone.position
-        result = []
-        for i, d in enumerate(self.drones):
-            if i == drone_id:
-                continue
-            dx = d.position.x - pos.x
-            dy = d.position.y - pos.y
-            if dx * dx + dy * dy <= r * r:
-                result.append(i)
-        return result
-
-    def get_perception(self, drone_id: int) -> dict:
-        """Legacy: same as get_observation. Prefer get_observation for RL."""
-        obs = self.get_observation(drone_id)
-        if obs is None:
-            return {"obstacles": [], "neighbors": [], "boundaries": {}}
-        return {
-            "obstacles": obs["obstacles"],
-            "neighbors": obs["neighbors"],
-            "boundaries": obs["boundaries"],
-        }
+    @property
+    def obs_size(self) -> int:
+        return OBS_SIZE

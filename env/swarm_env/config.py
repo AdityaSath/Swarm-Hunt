@@ -1,34 +1,93 @@
-"""Tunable constants for the swarm environment."""
+"""Tunable constants for the V1 pursuit environment."""
 
 import math
 
-ARENA_WIDTH = 1200   # 800 * 1.5
-ARENA_HEIGHT = 900   # 600 * 1.5
+# ---------------------------------------------------------------------------
+# Arena
+# ---------------------------------------------------------------------------
+ARENA_WIDTH = 1200
+ARENA_HEIGHT = 900
+WORLD_SCALE = max(ARENA_WIDTH, ARENA_HEIGHT)  # normalization denominator
 
-DRONE_COUNT = 10
+# ---------------------------------------------------------------------------
+# Timing
+# ---------------------------------------------------------------------------
+FPS = 60
+DT = 1.0 / FPS  # simulation timestep (single source of truth)
+MAX_STEPS = 30 * FPS  # episode truncation: 30 s wall-clock at nominal FPS
+
+# ---------------------------------------------------------------------------
+# Predators
+# ---------------------------------------------------------------------------
+DRONE_COUNT = 8
 DRONE_RADIUS = 15
-DRONE_SPEED = 80.0
+DRONE_SPEED = 80.0  # v_pred — max speed, clips desired-velocity magnitude
 
-# Helicopter-style movement: thrust (forward/back) + steer (turn left/right)
-# thrust in [-1, 1]: -1=full backward, 0=no forward/back, 1=full forward
-# steer in [-1, 1]: -1=turn left, 0=no turn, 1=turn right
-# Hold thrust+steer = curved path (circle). Steer only = spin in place.
-DRONE_MAX_TURN_RATE = math.pi / 3  # rad/s at full steer
+# ---------------------------------------------------------------------------
+# Prey
+# ---------------------------------------------------------------------------
+PREY_RADIUS = 2 * DRONE_RADIUS         # 30
+PREY_SPEED = 1.5 * DRONE_SPEED         # 120  (v_prey)
 
-# Sensor/perception: max distance drone can detect obstacles and other drones
-DRONE_PERCEPTION_RANGE = 120
+# ---------------------------------------------------------------------------
+# Sensing (radius-only, no LOS, obstacles do not block)
+# ---------------------------------------------------------------------------
+R_SENSE = 8 * PREY_RADIUS              # 240
 
-# Obstacle repulsion: soft push away when near (1/distance^2 falloff)
-OBSTACLE_REPULSION_RANGE = 100
-OBSTACLE_REPULSION_STRENGTH = 15000
+# ---------------------------------------------------------------------------
+# Capture geometry (predators + borders only; obstacles excluded in V1)
+# ---------------------------------------------------------------------------
+R_CAP = 2.5 * PREY_RADIUS              # 75   capture contribution radius
+R_WALL_CAP = 1.5 * PREY_RADIUS         # 45   border counts as blocker when prey is this close
+PHI_ESCAPE_MAX = math.radians(70)       # terminal capture: largest gap must be < this
+MIN_PREDATOR_CONTRIBUTORS = 4          # minimum predators within R_CAP for capture
+T_HOLD = 5                              # consecutive steps the capture condition must hold
 
+# ---------------------------------------------------------------------------
+# Tactical FSM thresholds (with hysteresis margins)
+# ---------------------------------------------------------------------------
+R_DANGER = 4 * PREY_RADIUS             # 120  FREE → THREATENED when any predator enters
+PHI_CONTAINED = math.radians(110)       # THREATENED → CONTAINED when gap < this
+MARGIN_CONTAINED = math.radians(15)     # leave CONTAINED only when gap > PHI_CONTAINED + this
+MARGIN_THREATENED = 1.5 * PREY_RADIUS  # leave THREATENED only when nearest predator > R_DANGER + this
+
+# ---------------------------------------------------------------------------
+# Prey hiding
+# ---------------------------------------------------------------------------
+T_HIDE_MAX = 20  # max steps prey may stay inside an obstacle
+
+# ---------------------------------------------------------------------------
+# Observation layout
+# ---------------------------------------------------------------------------
+K_TEAMMATES = 5  # max teammate slots per predator observation
+M_OBSTACLES = 4  # max obstacle slots per predator observation
+
+# ---------------------------------------------------------------------------
+# Rewards
+# ---------------------------------------------------------------------------
+REWARD_CAPTURE = 10.0
+REWARD_TIMEOUT = -5.0
+REWARD_THREATENED = 0.5
+REWARD_CONTAINED = 1.5
+REWARD_CONTAINMENT_STEP = 0.05
+REWARD_ESCAPE = -1.0               # prey escapes from CONTAINED → FREE
+PENALTY_OBSTACLE_COLLISION = -0.5
+PENALTY_PREDATOR_COLLISION = -0.2
+PENALTY_IDLE = -0.01               # per step when speed < IDLE_SPEED_THRESHOLD
+IDLE_SPEED_THRESHOLD = 1.0
+
+DIST_SHAPING_CLIP = 0.1            # per-step distance-shaping clipped to [-clip, +clip]
+CONTRIBUTOR_BONUS = 0.02           # tiny per-step bonus for predators within R_CAP
+CONTRIBUTOR_BONUS_ENABLED = True
+
+# ---------------------------------------------------------------------------
+# Obstacles (unchanged layout)
+# ---------------------------------------------------------------------------
 OBSTACLE_SIZES = {
-    "small": (39, 39),    # 30 * 1.3
-    "large": (104, 78),   # 80 * 1.3, 60 * 1.3
+    "small": (39, 39),
+    "large": (104, 78),
 }
 
-# Predefined obstacle positions (x, y, size_type) - center of obstacle
-# size_type: "small" or "large" (scaled 1.5x with arena)
 OBSTACLE_POSITIONS = [
     (225, 225, "large"),
     (600, 450, "large"),
@@ -36,11 +95,8 @@ OBSTACLE_POSITIONS = [
     (825, 150, "large"),
     (150, 525, "large"),
     (1050, 675, "large"),
-    (580, 150, "large"),   # moved to avoid overlap with 450,150
+    (580, 150, "large"),
     (750, 675, "large"),
     (150, 750, "large"),
     (1050, 500, "large"),
 ]
-
-FPS = 60
-DT = 1.0 / FPS
