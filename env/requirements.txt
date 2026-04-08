@@ -2,3 +2,9 @@ pygame>=2.5.0
 numpy>=1.24.0
 gymnasium>=0.29.0
 pettingzoo>=1.24.0
+
+# Training (AgileRL MATD3)
+torch>=2.0.1
+agilerl
+tqdm>=4.65.0
+tensorboard

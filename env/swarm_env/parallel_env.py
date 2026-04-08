@@ -20,14 +20,33 @@ from swarm_env.environment import Environment, OBS_SIZE
 
 
 class PursuitParallelEnv(ParallelEnv):
-    """PettingZoo Parallel API for the V1 pursuit environment."""
+    """PettingZoo Parallel API for the V1 pursuit environment.
+
+    Parameters
+    ----------
+    render_mode : str | None
+        Ignored during headless training; kept for PettingZoo API compat.
+    action_repeat : int
+        Number of core-env sub-steps per ``step()`` call.  Rewards are
+        summed across repeats; observations and done flags come from the
+        final sub-step.  Default ``1`` (no skip).
+    **env_kwargs
+        Forwarded to ``Environment.__init__`` (width, height, drone_count,
+        dt, seed).
+    """
 
     metadata = {"name": "pursuit_v1", "render_modes": ["human"]}
 
-    def __init__(self, render_mode: str | None = None, **env_kwargs: Any):
+    def __init__(
+        self,
+        render_mode: str | None = None,
+        action_repeat: int = 1,
+        **env_kwargs: Any,
+    ):
         super().__init__()
         self._env = Environment(**env_kwargs)
         self.render_mode = render_mode
+        self._action_repeat = max(1, int(action_repeat))
 
         self.possible_agents = [f"predator_{i}" for i in range(DRONE_COUNT)]
         self.agents = list(self.possible_agents)
@@ -75,15 +94,22 @@ class PursuitParallelEnv(ParallelEnv):
             self._agent_to_idx[a]: (float(v[0]), float(v[1]))
             for a, v in actions.items()
         }
-        obs_int, rew_int, term_int, trunc_int, infos_int = self._env.step(int_actions)
+
+        cumulative_rew: dict[int, float] = {i: 0.0 for i in range(len(self.possible_agents))}
+
+        for _ in range(self._action_repeat):
+            obs_int, rew_int, term_int, trunc_int, infos_int = self._env.step(int_actions)
+            for i, r in rew_int.items():
+                cumulative_rew[i] += r
+            if any(term_int.values()) or any(trunc_int.values()):
+                break
 
         obs = {self._idx_to_agent[i]: v for i, v in obs_int.items()}
-        rew = {self._idx_to_agent[i]: v for i, v in rew_int.items()}
+        rew = {self._idx_to_agent[i]: cumulative_rew[i] for i in range(len(self.possible_agents))}
         term = {self._idx_to_agent[i]: v for i, v in term_int.items()}
         trunc = {self._idx_to_agent[i]: v for i, v in trunc_int.items()}
         infos = {a: infos_int for a in self.agents}
 
-        # remove terminated / truncated agents from self.agents
         self.agents = [
             a for a in self.agents
             if not term.get(a, False) and not trunc.get(a, False)

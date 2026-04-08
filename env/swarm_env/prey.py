@@ -36,10 +36,12 @@ class Prey:
         radius: float = PREY_RADIUS,
         vx: float = 0.0,
         vy: float = 0.0,
+        speed: float = PREY_SPEED,
     ):
         self.position = pygame.math.Vector2(x, y)
         self.velocity = pygame.math.Vector2(vx, vy)
         self.collision_radius = radius
+        self.speed = speed
 
         # hide state
         self.hiding = False
@@ -162,7 +164,7 @@ class Prey:
     # ── helpers ───────────────────────────────────────────────────────────
 
     def _set_velocity_toward(self, angle: float, speed_frac: float = 1.0) -> None:
-        speed = PREY_SPEED * max(0.0, min(1.0, speed_frac))
+        speed = self.speed * max(0.0, min(1.0, speed_frac))
         self.velocity = pygame.math.Vector2(
             speed * math.cos(angle),
             speed * math.sin(angle),

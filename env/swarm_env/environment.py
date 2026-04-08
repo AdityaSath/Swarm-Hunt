@@ -40,6 +40,7 @@ from swarm_env.config import (
     DRONE_RADIUS,
     DRONE_SPEED,
     PREY_RADIUS,
+    PREY_SPEED,
     OBSTACLE_POSITIONS,
     DT,
     MAX_STEPS,
@@ -58,6 +59,8 @@ from swarm_env.config import (
     PENALTY_IDLE,
     IDLE_SPEED_THRESHOLD,
     DIST_SHAPING_CLIP,
+    ENCIRCLEMENT_SHAPING_SCALE,
+    ENCIRCLEMENT_SHAPING_CLIP,
     CONTRIBUTOR_BONUS,
     CONTRIBUTOR_BONUS_ENABLED,
 )
@@ -167,11 +170,13 @@ class Environment:
         drone_count: int = DRONE_COUNT,
         dt: float = DT,
         seed: int | None = None,
+        prey_speed_factor: float = 1.0,
     ):
         self.dt = dt
         self._width = width
         self._height = height
         self._drone_count = drone_count
+        self._prey_speed_factor = max(0.0, prey_speed_factor)
         self.arena = Arena(width, height)
 
         self.obstacles: list[Obstacle] = []
@@ -184,6 +189,7 @@ class Environment:
 
         # reward bookkeeping
         self._prev_mean_dist: float = 0.0
+        self._prev_gap_ratio: float = 1.0
         self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
 
         # per-step collision flags (set during physics, consumed by rewards)
@@ -212,6 +218,7 @@ class Environment:
         self._init_prey()
 
         self._prev_mean_dist = self._mean_pred_prey_dist()
+        self._prev_gap_ratio = 1.0
         self._prev_tactical = PreyTacticalState.FREE
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
@@ -401,6 +408,14 @@ class Environment:
         shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, delta / WORLD_SCALE))
         self._prev_mean_dist = mean_dist
 
+        # encirclement shaping: reward shrinking the prey's largest escape gap
+        gap_ratio = gap.largest_gap / (2 * math.pi)
+        gap_delta = self._prev_gap_ratio - gap_ratio  # positive = gap shrinking = good
+        shared += ENCIRCLEMENT_SHAPING_SCALE * max(
+            -ENCIRCLEMENT_SHAPING_CLIP, min(ENCIRCLEMENT_SHAPING_CLIP, gap_delta)
+        )
+        self._prev_gap_ratio = gap_ratio
+
         # penalties (shared)
         for i in range(n):
             if self._obs_collisions[i]:
@@ -553,20 +568,18 @@ class Environment:
             )
 
     def _init_prey(self) -> None:
+        prey_speed = PREY_SPEED * self._prey_speed_factor
         margin = PREY_RADIUS
         max_attempts = 500
         for _ in range(max_attempts):
             x = random.uniform(margin, self._width - margin)
             y = random.uniform(margin, self._height - margin)
-            # prey may spawn on obstacles (it passes through them),
-            # but must not start already captured
             pred_pos = [(d.position.x, d.position.y) for d in self.drones]
             gap = compute_escape_gap(x, y, pred_pos, self._width, self._height)
             if gap.largest_gap >= math.radians(120):
-                self.prey = Prey(x, y, radius=PREY_RADIUS)
+                self.prey = Prey(x, y, radius=PREY_RADIUS, speed=prey_speed)
                 return
-        # fallback: spawn at arena center
-        self.prey = Prey(self._width / 2, self._height / 2, radius=PREY_RADIUS)
+        self.prey = Prey(self._width / 2, self._height / 2, radius=PREY_RADIUS, speed=prey_speed)
 
     def _is_valid_spawn(self, x: float, y: float, radius: float) -> bool:
         if x - radius < 0 or x + radius > self._width:

@@ -77,6 +77,8 @@ PENALTY_IDLE = -0.01               # per step when speed < IDLE_SPEED_THRESHOLD
 IDLE_SPEED_THRESHOLD = 1.0
 
 DIST_SHAPING_CLIP = 0.1            # per-step distance-shaping clipped to [-clip, +clip]
+ENCIRCLEMENT_SHAPING_SCALE = 2.0   # weight for gap-closing shaping (stronger than distance)
+ENCIRCLEMENT_SHAPING_CLIP = 0.2    # per-step encirclement delta clamp
 CONTRIBUTOR_BONUS = 0.02           # tiny per-step bonus for predators within R_CAP
 CONTRIBUTOR_BONUS_ENABLED = True
 
