@@ -15,6 +15,7 @@ import argparse
 import os
 import time
 from collections import deque
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -333,12 +334,14 @@ def main() -> None:
         # ── periodic checkpoint ───────────────────────────────────────────
         generation += 1
         if generation % args.save_every == 0:
-            ckpt_path = os.path.join(args.save_dir, "MATD3_latest.pt")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ckpt_path = os.path.join(args.save_dir, f"MATD3_gen{generation}_{ts}.pt")
             elite.save_checkpoint(ckpt_path)
             print(f"  [checkpoint] gen {generation} -> {ckpt_path}")
 
     # ── final save ────────────────────────────────────────────────────────
-    save_path = os.path.join(args.save_dir, "MATD3_pursuit_v1.pt")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = os.path.join(args.save_dir, f"MATD3_final_{ts}.pt")
     elite.save_checkpoint(save_path)
     print(f"\nElite agent saved to {save_path}")
 
