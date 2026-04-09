@@ -452,6 +452,16 @@ class Environment:
         x_min, y_min, x_max, y_max = self.arena.get_bounds()
         obs_rects = [o.get_collision_rect() for o in self.obstacles]
 
+        # Team sensing: if any predator is within R_SENSE of prey, all predators
+        # receive full prey-relative features (shared "spotter" information).
+        team_sees_prey = False
+        if self.prey is not None:
+            prx_g, pry_g = self.prey.position.x, self.prey.position.y
+            for d in self.drones:
+                if math.hypot(d.position.x - prx_g, d.position.y - pry_g) <= R_SENSE:
+                    team_sees_prey = True
+                    break
+
         for i, drone in enumerate(self.drones):
             obs = np.zeros(OBS_SIZE, dtype=np.float32)
             offset = 0
@@ -468,8 +478,8 @@ class Environment:
             if self.prey is not None:
                 prx, pry = self.prey.position.x, self.prey.position.y
                 dist_prey = math.hypot(prx - px, pry - py)
-                if dist_prey <= R_SENSE:
-                    obs[offset] = 1.0  # prey_visible
+                if team_sees_prey:
+                    obs[offset] = 1.0  # prey info available (team spotter within R_SENSE)
                     obs[offset + 1] = (prx - px) / WORLD_SCALE
                     obs[offset + 2] = (pry - py) / WORLD_SCALE
                     obs[offset + 3] = (self.prey.velocity.x - drone.velocity.x) / DRONE_SPEED

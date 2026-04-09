@@ -183,11 +183,11 @@ Layout:
    - own pos `(x, y)` normalized by `WORLD_SCALE`
    - own vel `(vx, vy)` normalized by `DRONE_SPEED`
 2. Prey slot (6):
-   - `prey_visible` flag
+   - `prey_visible` flag (1 iff **team sensing** is active)
    - relative prey pos
    - relative prey vel
    - prey distance
-   - zeroed if prey not in `R_SENSE`
+   - **Team sensing:** if **any** predator is within `R_SENSE` of the prey, **all** predators get full prey-relative features (shared spotter). If **no** predator is in range, the slot is zeroed (no stale coordinates).
 3. Teammates (`K_TEAMMATES=5`, each 6):
    - valid flag
    - relative pos
@@ -204,9 +204,9 @@ Layout:
    - distances to left/right/top/bottom
 
 Sensing rule:
-- Radius-only (`distance <= R_SENSE`)
-- No line-of-sight test
-- Obstacles do not block sensing
+- **Prey:** at least one predator must be within `R_SENSE` of the prey; then **all** agents get prey-relative features (team broadcast). No stale prey coords when nobody senses prey.
+- **Teammates / obstacles:** radius-only (`distance <= R_SENSE`) from self, as before.
+- No line-of-sight test; obstacles do not block sensing.
 
 ## Action Spaces
 
