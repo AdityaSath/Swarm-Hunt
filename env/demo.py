@@ -5,6 +5,7 @@ Usage:
     python demo.py                                          # most recent .pt
     python demo.py --checkpoint models/MATD3/some_file.pt
     python demo.py --prey-speed-factor 0.5                  # easier prey
+    python demo.py --action-repeat 4                        # match training (default)
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint", type=str, default=None,
                    help="Path to .pt file (default: most recent in models/MATD3/)")
     p.add_argument("--prey-speed-factor", type=float, default=1.0)
+    p.add_argument("--action-repeat", type=int, default=4,
+                   help="Physics steps per policy decision (match train.py)")
     p.add_argument("--episodes", type=int, default=0,
                    help="Auto-reset after N episodes (0 = infinite, manual R to reset)")
     return p.parse_args()
@@ -86,6 +89,8 @@ def main() -> None:
     episode_over = False
     episode_msg = ""
     paused = False
+    repeat_left = 0
+    cached_actions: dict[int, tuple[float, float]] | None = None
 
     running = True
     while running:
@@ -100,18 +105,23 @@ def main() -> None:
                 elif event.key == pygame.K_r:
                     env.reset()
                     episode_over = False
+                    repeat_left = 0
+                    cached_actions = None
 
         if not paused and not episode_over:
-            obs_int = env._compute_observations()
-            obs = {idx_to_agent[i]: v for i, v in obs_int.items()}
+            if repeat_left <= 0:
+                obs_int = env._compute_observations()
+                obs = {idx_to_agent[i]: v for i, v in obs_int.items()}
+                cont_actions, _ = agent.get_action(obs)
+                cached_actions = {}
+                for i in range(DRONE_COUNT):
+                    a = cont_actions[idx_to_agent[i]].reshape(-1)
+                    cached_actions[i] = (float(a[0]), float(a[1]))
+                repeat_left = max(1, args.action_repeat)
 
-            cont_actions, _ = agent.get_action(obs)
-            int_actions = {}
-            for i in range(DRONE_COUNT):
-                a = cont_actions[idx_to_agent[i]].reshape(-1)
-                int_actions[i] = (float(a[0]), float(a[1]))
-
-            _, _, terms, truncs, infos = env.step(int_actions)
+            assert cached_actions is not None
+            _, _, terms, truncs, infos = env.step(cached_actions)
+            repeat_left -= 1
 
             if any(terms.values()):
                 episode_over = True
@@ -140,7 +150,7 @@ def main() -> None:
         }
         state_text = small_font.render(
             f"Tactical: {tactical.name}  |  Step: {env._step_count}  |  "
-            f"Prey speed: {args.prey_speed_factor:.1f}x",
+            f"Prey: {args.prey_speed_factor:.1f}x  |  action_repeat: {args.action_repeat}",
             True, state_colors.get(tactical, (200, 200, 200)),
         )
         screen.blit(state_text, (10, ARENA_HEIGHT - 30))

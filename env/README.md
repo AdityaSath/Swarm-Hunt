@@ -1,155 +1,307 @@
-# 2D Swarm Environment
+# V1 Multi-Agent Pursuit Environment
 
-A modular Pygame-based 2D swarm prototype environment with a bounded arena, obstacles, and multiple hexagon-shaped drones. Designed for extensibility (flocking, pathfinding, RL) rather than a one-off visual demo.
+A 2D continuous multi-agent pursuit environment with:
+- Learning agents: predator drones
+- Scripted agent: one prey
+- API target: PettingZoo Parallel (`PursuitParallelEnv`)
+- Trainer target: AgileRL
 
-## Setup
+This README reflects the current code in `env/swarm_env/*`.
+
+## Quick Start
 
 ```bash
 pip install -r requirements.txt
-```
-
-## Run
-
-```bash
 python main.py
 ```
 
-- **Space**: Pause / resume
-- **Escape**: Quit
+Demo controls (`main.py`):
+- `Space`: pause/resume
+- `R`: reset episode
+- `Esc`: quit
 
----
+### Trained MATD3 demo (`demo.py`)
 
-## What's Been Built
+Runs pygame with policies loaded from a checkpoint (default: most recent `models/MATD3/*.pt`).
 
-### 1. Base Environment (Initial Plan)
+Controls: same as above (`Space`, `R`, `Esc`).
 
-- **Arena** — 800×600 bounded rectangle with `contains()`, `clamp()`, `get_bounds()`
-- **Obstacles** — 10 static rectangles (6 small 30×30, 4 large 80×60)
-- **Drones** — Hexagon agents with position, velocity, heading, collision radius
-- **Physics** — Bounce off walls, obstacles, and each other (no stopping)
-- **Vision cone** — 45° half-angle, configurable, drawn for each drone
+Important: training uses **`action_repeat=4`** on `PursuitParallelEnv` (see `train.py`). The demo repeats each policy action for the same number of physics steps so behavior matches training and motion is stable. Override only if your checkpoint was trained with a different repeat.
 
-### 2. Drone as Independent Agent
+CLI (common options):
 
-- **State only** — Drones hold: `position`, `velocity`, `heading`, `collision_radius`, `perception_range`
-- **No world access** — Drones do not read full world state
-- **Limited sensing** — `perception_range` (120 px) caps what they can "see"
+| Flag | Default | Notes |
+|------|---------|--------|
+| `--checkpoint` | latest in `models/MATD3/` | Path to `.pt` |
+| `--action-repeat` | `4` | Physics steps per policy decision; match `train.py` |
+| `--prey-speed-factor` | `1.0` | Scales prey speed in the env |
+| `--episodes` | `0` | Auto-exit after N completed episodes (`0` = run until closed) |
 
-### 3. Local Neighbor Lookup
+Example:
 
-- **`swarm_env/spatial.py`** — Pluggable neighbor search
-- **`NeighborFinder`** — Protocol with `find_drone_neighbors()` and `find_nearby_obstacles()`
-- **`DistanceBasedNeighborFinder`** — O(n²) distance-based implementation
-- **Swappable** — Add `GridNeighborFinder` or quadtree later; pass into `Environment(neighbor_finder=...)` without changing env logic
+```bash
+python demo.py --checkpoint models/MATD3/MATD3_final_12345.pt --action-repeat 4
+```
 
-### 4. RL-Ready API
+## Current Implemented Defaults
 
-- **`reset(seed)`** → `(observations, infos)`
-- **`step(actions)`** → `(observations, rewards, terminations, truncations, infos)`
-- **`actions`** — `agent_id -> (vx, vy)`; missing agents keep current velocity
-- **`get_observation(agent_id)`** — Local observation for one agent
+Defined in `swarm_env/config.py`:
+- Predators: `DRONE_COUNT = 8`
+- Prey: `1`
+- `r_prey = 2 * r_pred`
+- `v_prey = 1.5 * v_pred`
+- `R_SENSE = 8 * r_prey`
+- `R_DANGER = 4 * r_prey`
+- `R_CAP = 2.5 * r_prey`
+- `R_WALL_CAP = 1.5 * r_prey`
+- `phi_escape_max = 70 deg`
+- `T_HOLD = 5`
+- `T_HIDE_MAX = 20`
+- `DT = 1 / FPS`, `FPS = 60`
+- `MAX_STEPS = 30 * FPS` (30 seconds)
 
-### 5. Separation of Concerns
+## Architecture
 
-- **Environment** — Applies actions, runs physics, computes observations
-- **Drones** — State containers only; no decision logic
-- **Physics** — `_apply_actions()`, `_physics_step()` isolated from observation logic
+### Core env (training logic)
+- File: `swarm_env/environment.py`
+- Class: `Environment`
+- Uses integer agent indices (`0..N-1`)
+- No PettingZoo dependency
 
----
+Step order:
+1. Apply predator desired velocities
+2. Scripted prey policy
+3. Physics and collisions
+4. Capture geometry + tactical FSM
+5. Reward computation
+6. Observation assembly
 
-## Behavior
+### Thin PettingZoo adapter
+- File: `swarm_env/parallel_env.py`
+- Class: `PursuitParallelEnv`
+- Maps `predator_i <-> i`
+- Exposes `ParallelEnv` API + Gymnasium spaces
+- **`action_repeat`**: each `step()` applies the same action for `action_repeat` physics steps (default in training: `4`; stops early if the episode terminates)
 
-| Mode | Behavior |
-|------|----------|
-| **Demo** (`step()` no args) | Drones keep current velocity; bounce off walls, obstacles, and each other |
-| **With actions** (`step({0: (50,0), ...})`) | Specified drones get new velocities; others unchanged |
-| **Policies** | None implemented yet; behavior is unchanged from before the refactor |
+## How Predators Work
 
----
+Predators are kinematic agents (`swarm_env/drone.py`):
+- Action: `(vx_desired, vy_desired)`
+- Speed clipping: `||v|| <= DRONE_SPEED`
+- Integration: `position += velocity * DT`
+- Predators cannot pass through walls, obstacles, or other predators
 
-## Observations: Local Only
+### Demo-mode movement
+When `actions=None`, the env uses smooth random wandering:
+- Keeps a sampled velocity for about 1 second
+- Then samples a new direction/speed
 
-Each agent's observation includes only what is within `perception_range`:
+For RL training, always pass explicit actions.
 
-- **`obstacles`** — Obstacles in range: `{relative_pos, distance, rect}`
-- **`neighbors`** — Other drones in range: `{relative_pos, distance, velocity, id}`
-- **`boundaries`** — Distances to arena edges
-- **`self_state`** — Own `position`, `velocity`, `heading`
+## How Prey Works (Scripted)
 
-No global world state is exposed to agents.
+File: `swarm_env/prey.py`
 
----
+Priority policy:
+1. If threatened: move toward largest escape gap
+2. If threatened and obstacle nearby: may enter obstacle
+3. If hidden: remain hidden up to `T_HIDE_MAX`, then forced exit
+4. Otherwise: move away from predator cluster direction
 
-## Swapping in a Grid Later
+Physics rule:
+- Prey can pass through obstacles
+- Prey is clamped by arena borders
 
-Yes. The design supports swapping the neighbor finder cleanly:
+## Capture Logic (Border-Aware Angular Enclosure)
+
+File: `swarm_env/capture.py`
+
+One geometry implementation is reused by both:
+- terminal capture checks
+- prey escape-gap steering
+
+V1 blockers:
+- Predator blockers: predators within `R_CAP`
+- Border blockers: walls when prey is within `R_WALL_CAP`
+- Obstacles are excluded from capture geometry
+
+Terminal capture condition:
+- largest escape gap `< PHI_ESCAPE_MAX`
+- predator contributors `>= MIN_PREDATOR_CONTRIBUTORS` (currently 4)
+- condition holds for `T_HOLD` consecutive steps
+
+## Tactical State Machine
+
+Prey tactical states:
+- `FREE`
+- `THREATENED`
+- `CONTAINED`
+- `CAPTURED`
+
+Hysteresis:
+- Enter `CONTAINED` when `gap < PHI_CONTAINED`
+- Leave `CONTAINED` when `gap > PHI_CONTAINED + MARGIN_CONTAINED`
+- Threatened recovery uses `MARGIN_THREATENED`
+
+Global episode state:
+- `IN_PURSUIT`
+- `CAPTURED`
+- `TIMEOUT`
+
+## Rewards (Shared Team Reward)
+
+All predators receive the same base team reward per step.
+
+Included terms:
+- Terminal:
+  - capture: `+10`
+  - timeout: `-5`
+- Transitions:
+  - `FREE -> THREATENED`: `+0.5`
+  - `THREATENED -> CONTAINED`: `+1.5`
+  - escape from containment: `-1.0`
+- Maintenance:
+  - containment step: `+0.05`
+- Penalties:
+  - obstacle collision: `-0.5` (shared contribution)
+  - predator collision: `-0.2` (shared contribution)
+  - idle penalty: small per-step
+- Shaping:
+  - mean predator-prey distance delta, clipped by `DIST_SHAPING_CLIP`
+- Optional:
+  - tiny contributor bonus for actual capture contributors
+
+## Observation Vector (Per Predator)
+
+Type: fixed-size `np.float32` vector.
+
+Current size:
+- `OBS_SIZE = 64`
+
+Layout:
+1. Self (4):
+   - own pos `(x, y)` normalized by `WORLD_SCALE`
+   - own vel `(vx, vy)` normalized by `DRONE_SPEED`
+2. Prey slot (6):
+   - `prey_visible` flag
+   - relative prey pos
+   - relative prey vel
+   - prey distance
+   - zeroed if prey not in `R_SENSE`
+3. Teammates (`K_TEAMMATES=5`, each 6):
+   - valid flag
+   - relative pos
+   - relative vel
+   - distance
+   - sorted by distance ascending, then padded
+4. Obstacles (`M_OBSTACLES=4`, each 5):
+   - valid flag
+   - relative obstacle center
+   - obstacle characteristic radius
+   - distance
+   - sorted by distance ascending, then padded
+5. Borders (4):
+   - distances to left/right/top/bottom
+
+Sensing rule:
+- Radius-only (`distance <= R_SENSE`)
+- No line-of-sight test
+- Obstacles do not block sensing
+
+## Action Spaces
+
+### Core `Environment`
+- `step` input: `dict[int, tuple[float, float]]`
+- Meaning: desired world-frame velocity components
+- Env clips to `DRONE_SPEED`
+
+### PettingZoo `PursuitParallelEnv`
+- Agents: `predator_0` ... `predator_7`
+- `action_space(agent) = Box(low=-DRONE_SPEED, high=DRONE_SPEED, shape=(2,), dtype=float32)`
+- `observation_space(agent) = Box(shape=(OBS_SIZE,), dtype=float32)`
+
+## API Usage
+
+### Core env (index-based)
 
 ```python
-# Current (distance-based)
-env = Environment(neighbor_finder=DistanceBasedNeighborFinder())
+from swarm_env.environment import Environment
 
-# Later (grid-based)
-env = Environment(neighbor_finder=GridNeighborFinder(cell_size=50))
+env = Environment(seed=0)
+obs, infos = env.reset(seed=0)
+
+actions = {i: (10.0, 0.0) for i in range(env.num_agents)}
+obs, rewards, terminations, truncations, infos = env.step(actions)
 ```
 
-`Environment` only depends on the `NeighborFinder` interface. Implement `find_drone_neighbors()` and `find_nearby_obstacles()` with the same signatures and return types, and you can swap without touching environment or drone code.
-
----
-
-## File Layout
-
-```
-swarm_env/
-├── arena.py        # Bounded arena
-├── obstacle.py     # Static obstacles
-├── drone.py        # State container (position, velocity, heading, radius, perception_range)
-├── spatial.py      # NeighborFinder protocol + DistanceBasedNeighborFinder
-├── environment.py  # reset, step(actions), _physics_step, _compute_observations
-└── config.py       # Tunables
-main.py             # Pygame loop, step() with no actions (demo)
-```
-
----
-
-## API Reference
-
-### RL-Ready API
+### PettingZoo parallel env (string-agent)
 
 ```python
-# Reset
-observations, infos = env.reset(seed=42)
+from swarm_env.parallel_env import PursuitParallelEnv
 
-# Step: actions = agent_id -> (vx, vy). None = keep current velocity.
-observations, rewards, terminations, truncations, infos = env.step(actions)
+env = PursuitParallelEnv(seed=0)
+obs, infos = env.reset(seed=0)
 
-# Single-agent observation
-obs = env.get_observation(agent_id)
+while env.agents:
+    actions = {a: env.action_space(a).sample() for a in env.agents}
+    obs, rewards, terms, truncs, infos = env.step(actions)
 ```
 
-### Observation Structure
+## AgileRL Integration Notes
 
-```python
-obs = env.get_observation(0)
-# obs["obstacles"]   # [{relative_pos, distance, rect}, ...] in range
-# obs["neighbors"]   # [{relative_pos, distance, velocity, id}, ...] in range
-# obs["boundaries"]  # {left, right, top, bottom} to arena edges
-# obs["self_state"]  # {position, velocity, heading}
+Use `PursuitParallelEnv` as the training entrypoint.
+
+Typical setup:
+1. Instantiate `PursuitParallelEnv` (with `action_repeat` aligned across train/eval/demo — default **`4`** in `train.py`)
+2. Call `reset()` for dict observations
+3. Build policy networks from `action_space` / `observation_space`
+4. Train with the shared reward signal (already handled by env)
+
+Because this env follows PettingZoo Parallel API, it plugs into PettingZoo-compatible AgileRL pipelines directly.
+
+Training script: `train.py` (check `--help` for curriculum, vectorized envs, and other flags). For visual evaluation of a saved policy, use `demo.py` and keep `--action-repeat` consistent with training.
+
+## Tests
+
+Run from `env/`:
+
+```bash
+python tests/test_capture.py
+python tests/test_parallel_api.py
 ```
 
-### Global Query API (debugging)
+Coverage:
+- 4 contributors + border-aware enclosure captures after `T_HOLD`
+- 3 contributors does not capture
+- Prey forced exit after `T_HIDE_MAX`
+- PettingZoo `parallel_api_test` and random rollout smoke test
 
-```python
-env.get_drone_positions()   # list of (x, y)
-env.get_drone_velocities()  # list of (vx, vy)
-env.get_obstacles()         # list of pygame.Rect
-env.get_neighbors(drone_id, radius=None)  # uses drone.perception_range if radius is None
+## File Map
+
+```text
+env/
+├── main.py
+├── demo.py
+├── train.py
+├── requirements.txt
+├── tests/
+│   ├── __init__.py
+│   ├── test_capture.py
+│   └── test_parallel_api.py
+└── swarm_env/
+    ├── __init__.py
+    ├── arena.py
+    ├── obstacle.py
+    ├── drone.py
+    ├── prey.py
+    ├── capture.py
+    ├── environment.py
+    ├── parallel_env.py
+    └── config.py
 ```
 
----
+## Team Notes
 
-## Summary
-
-- **Drones** — State containers; no decision logic.
-- **Observations** — Local only; limited by `perception_range`.
-- **Neighbor lookup** — Pluggable; grid/quadtree can replace distance-based search.
-- **Policies** — Not implemented; behavior is still bouncing with random initial velocities.
+- If you want exactly 4 learning predators, set `DRONE_COUNT = 4` in `config.py`.
+- Agent names in `PursuitParallelEnv` are generated from `DRONE_COUNT`.
+- Keep `capture.py` as the single source of truth for escape-gap geometry.
