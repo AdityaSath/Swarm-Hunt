@@ -31,7 +31,7 @@ from tqdm import trange
 from swarm_env.parallel_env import PursuitParallelEnv
 
 CURRICULUM_STAGES = [
-    {"prey_speed_factor": 0.5, "label": "Stage 1 (prey 0.5x)"},
+    {"prey_speed_factor": 0.3, "label": "Stage 1 (prey 0.3x)"},
     {"prey_speed_factor": 0.75, "label": "Stage 2 (prey 0.75x)"},
     {"prey_speed_factor": 1.0, "label": "Stage 3 (prey 1.0x — full)"},
 ]

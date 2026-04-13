@@ -168,22 +168,8 @@ class TacticalFSM:
         prey_x: float,
         prey_y: float,
     ) -> PreyTacticalState:
-        """
-        Advance the FSM one step and return the new state.
-
-        Transition rules (with hysteresis):
-            FREE → THREATENED       : any predator within R_DANGER
-            THREATENED → FREE       : nearest predator > R_DANGER + MARGIN_THREATENED
-            THREATENED → CONTAINED  : largest gap < PHI_CONTAINED
-            CONTAINED → THREATENED  : gap > PHI_CONTAINED + MARGIN_CONTAINED
-            CONTAINED → CAPTURED    : gap < PHI_ESCAPE_MAX  AND
-                                      predator_contributors >= MIN_PREDATOR_CONTRIBUTORS
-                                      for T_HOLD consecutive steps
-        """
         nearest = nearest_predator_distance(prey_x, prey_y, predator_positions)
         lg = gap.largest_gap
-
-        prev = self.state
 
         if self.state == PreyTacticalState.FREE:
             if nearest <= R_DANGER:
@@ -203,17 +189,11 @@ class TacticalFSM:
                 self.state = PreyTacticalState.THREATENED
                 self._hold_counter = 0
             else:
-                # check terminal capture condition
-                if (
-                    lg < PHI_ESCAPE_MAX
-                    and gap.predator_contributors >= MIN_PREDATOR_CONTRIBUTORS
-                ):
-                    self._hold_counter += 1
-                    if self._hold_counter >= T_HOLD:
-                        self.state = PreyTacticalState.CAPTURED
+                # temporary debug rule: if any predator is close enough, count as capture
+                if nearest <= R_CAP:
+                    self.state = PreyTacticalState.CAPTURED
                 else:
                     self._hold_counter = 0
 
-        # CAPTURED is terminal — no transitions out
-
         return self.state
+    

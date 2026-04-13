@@ -3,7 +3,7 @@
 import pygame
 
 from swarm_env.environment import Environment
-from swarm_env.config import ARENA_WIDTH, ARENA_HEIGHT, FPS, DT
+from swarm_env.config import ARENA_WIDTH, ARENA_HEIGHT, FPS, DT, DRONE_SPEED
 
 
 def main() -> None:
@@ -33,7 +33,21 @@ def main() -> None:
                     episode_over = False
 
         if not paused and not episode_over:
-            _, _, terms, truncs, _ = env.step()
+            actions = {}
+
+            if env.prey is not None:
+                for i, drone in enumerate(env.drones):
+                    dx = env.prey.position.x - drone.position.x
+                    dy = env.prey.position.y - drone.position.y
+                    norm = (dx**2 + dy**2) ** 0.5 + 1e-6
+
+                    vx = dx / norm * DRONE_SPEED
+                    vy = dy / norm * DRONE_SPEED
+
+                    actions[i] = (vx, vy)
+
+            _, _, terms, truncs, _ = env.step(actions)
+
             if any(terms.values()):
                 episode_over = True
                 episode_msg = "CAPTURED - press R to restart"

@@ -49,6 +49,12 @@ from swarm_env.config import (
     M_OBSTACLES,
     WORLD_SCALE,
     REWARD_CAPTURE,
+    REWARD_CORNERED,
+    DIST_SHAPING_SCALE,
+    DIST_SHAPING_CLIP,
+    REWARD_PROXIMITY,
+    PROXIMITY_THRESHOLD,
+    REWARD_CONTACT,
     REWARD_TIMEOUT,
     REWARD_THREATENED,
     REWARD_CONTAINED,
@@ -58,7 +64,6 @@ from swarm_env.config import (
     PENALTY_PREDATOR_COLLISION,
     PENALTY_IDLE,
     IDLE_SPEED_THRESHOLD,
-    DIST_SHAPING_CLIP,
     ENCIRCLEMENT_SHAPING_SCALE,
     ENCIRCLEMENT_SHAPING_CLIP,
     CONTRIBUTOR_BONUS,
@@ -373,6 +378,9 @@ class Environment:
         gap = compute_escape_gap(px, py, pred_pos, self._width, self._height)
         tactical = self._fsm.update(gap, pred_pos, px, py)
         return gap, tactical
+    
+    def _is_cornered(self, gap: GapResult) -> bool:
+        return gap.border_blocker_count >= 2 and gap.predator_contributors >= 2
 
     # ── rewards ───────────────────────────────────────────────────────────
 
@@ -380,63 +388,37 @@ class Environment:
         n = len(self.drones)
         shared = 0.0
 
-        # terminal
+        # 1. capture reward
         if tactical == PreyTacticalState.CAPTURED:
             shared += REWARD_CAPTURE
-        elif self._step_count >= MAX_STEPS:
-            shared += REWARD_TIMEOUT
 
-        # tactical transitions
-        prev = self._prev_tactical
-        if prev == PreyTacticalState.FREE and tactical == PreyTacticalState.THREATENED:
-            shared += REWARD_THREATENED
-        if prev == PreyTacticalState.THREATENED and tactical == PreyTacticalState.CONTAINED:
-            shared += REWARD_CONTAINED
-        if (
-            prev in (PreyTacticalState.CONTAINED, PreyTacticalState.THREATENED)
-            and tactical == PreyTacticalState.FREE
-        ):
-            shared += REWARD_ESCAPE
+        # 2. corner reward
+        if tactical != PreyTacticalState.CAPTURED and self._is_cornered(gap):
+            shared += REWARD_CORNERED
 
-        # containment maintenance
-        if tactical == PreyTacticalState.CONTAINED:
-            shared += REWARD_CONTAINMENT_STEP
-
-        # distance shaping (clipped)
+        # 3. distance reward
         mean_dist = self._mean_pred_prey_dist()
-        delta = self._prev_mean_dist - mean_dist  # positive = got closer
-        shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, delta / WORLD_SCALE))
+        delta = self._prev_mean_dist - mean_dist
+        shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, DIST_SHAPING_SCALE * delta))
         self._prev_mean_dist = mean_dist
 
-        # encirclement shaping: reward shrinking the prey's largest escape gap
-        gap_ratio = gap.largest_gap / (2 * math.pi)
-        gap_delta = self._prev_gap_ratio - gap_ratio  # positive = gap shrinking = good
-        shared += ENCIRCLEMENT_SHAPING_SCALE * max(
-            -ENCIRCLEMENT_SHAPING_CLIP, min(ENCIRCLEMENT_SHAPING_CLIP, gap_delta)
-        )
-        self._prev_gap_ratio = gap_ratio
+        # 4. proximity reward
+        if self.prey is not None:
+            px, py = self.prey.position.x, self.prey.position.y
+            for d in self.drones:
+                dist = math.hypot(d.position.x - px, d.position.y - py)
+                if dist < PROXIMITY_THRESHOLD:
+                    shared += REWARD_PROXIMITY / len(self.drones)
 
-        # penalties (shared)
-        for i in range(n):
-            if self._obs_collisions[i]:
-                shared += PENALTY_OBSTACLE_COLLISION / n
-            if self._pred_collisions[i]:
-                shared += PENALTY_PREDATOR_COLLISION / n
+        # 5. contact reward
+        if self.prey is not None:
+            px, py = self.prey.position.x, self.prey.position.y
+            for d in self.drones:
+                dist = math.hypot(d.position.x - px, d.position.y - py)
+                if dist < (d.radius + self.prey.radius):
+                    shared += REWARD_CONTACT / len(self.drones)
 
-        # idle penalty
-        for d in self.drones:
-            if d.velocity.length() < IDLE_SPEED_THRESHOLD:
-                shared += PENALTY_IDLE / n
-
-        rewards = {i: shared for i in range(n)}
-
-        # optional per-agent contributor bonus
-        if CONTRIBUTOR_BONUS_ENABLED:
-            for idx in gap.contributor_indices:
-                if 0 <= idx < n:
-                    rewards[idx] += CONTRIBUTOR_BONUS
-
-        return rewards
+        return {i: shared for i in range(n)}
 
     def _mean_pred_prey_dist(self) -> float:
         if self.prey is None or not self.drones:
