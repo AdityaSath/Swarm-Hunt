@@ -145,7 +145,6 @@ def main() -> None:
         state_colors = {
             PreyTacticalState.FREE: (100, 200, 100),
             PreyTacticalState.THREATENED: (220, 200, 80),
-            PreyTacticalState.CONTAINED: (220, 140, 60),
             PreyTacticalState.CAPTURED: (255, 80, 80),
         }
         state_text = small_font.render(

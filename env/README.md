@@ -50,12 +50,12 @@ Defined in `swarm_env/config.py`:
 - Prey: `1`
 - `r_prey = 2 * r_pred`
 - `v_prey = 1.5 * v_pred`
-- `R_SENSE = 8 * r_prey`
-- `R_DANGER = 4 * r_prey`
-- `R_CAP = 2.5 * r_prey`
-- `R_WALL_CAP = 1.5 * r_prey`
-- `phi_escape_max = 70 deg`
-- `T_HOLD = 5`
+- `R_SENSE = 8 * r_prey` (team prey sensing / teammate slots)
+- `R_DANGER = 4 * r_prey` (FREE ↔ THREATENED, nearest-predator distance)
+- `R_CAP = 2.5 * r_prey` (legacy base; capture ring is scaled from this)
+- `R_CAPTURE_RANGE = 1.2 * R_CAP` (predators inside this radius count toward capture)
+- `CAPTURE_HOLD_SECONDS = 2.0` → `CAPTURE_HOLD_STEPS = 2 * FPS` (consecutive steps the hold must stay valid)
+- `COMBO_CAPTURE_NEED = 4` (need **walls intersecting blue circle + drones inside `R_CAPTURE_RANGE`** ≥ this to build the hold)
 - `T_HIDE_MAX = 20`
 - `DT = 1 / FPS`, `FPS = 60`
 - `MAX_STEPS = 30 * FPS` (30 seconds)
@@ -72,7 +72,7 @@ Step order:
 1. Apply predator desired velocities
 2. Scripted prey policy
 3. Physics and collisions
-4. Capture geometry + tactical FSM
+4. Distance capture check + tactical FSM
 5. Reward computation
 6. Observation assembly
 
@@ -103,50 +103,41 @@ For RL training, always pass explicit actions.
 File: `swarm_env/prey.py`
 
 Priority policy:
-1. If threatened: move toward largest escape gap
-2. If threatened and obstacle nearby: may enter obstacle
-3. If hidden: remain hidden up to `T_HIDE_MAX`, then forced exit
-4. Otherwise: move away from predator cluster direction
+1. If threatened: flee **away from the nearest predator** (velocity in the outward radial direction)
+2. If threatened and an obstacle is nearby: may enter obstacle to hide
+3. If hidden: remain hidden up to `T_HIDE_MAX`, then forced exit (flee from nearest predator)
+4. Otherwise: gentle wander away from the predator cluster centroid
 
 Physics rule:
 - Prey can pass through obstacles
 - Prey is clamped by arena borders
 
-## Capture Logic (Border-Aware Angular Enclosure)
+## Capture Logic (Distance Ring + Hold)
 
 File: `swarm_env/capture.py`
 
-One geometry implementation is reused by both:
-- terminal capture checks
-- prey escape-gap steering
+Capture is **distance-based** (no angular gap math).
 
-V1 blockers:
-- Predator blockers: predators within `R_CAP`
-- Border blockers: walls when prey is within `R_WALL_CAP`
-- Obstacles are excluded from capture geometry
+- **`walls_intersecting_capture_circle`**: count arena edges (0–4) whose perpendicular distance to the prey is at most **`R_CAPTURE_RANGE`** (the blue disk touches that wall).
+- **`predators_in_capture_range`**: count predator centers within **`R_CAPTURE_RANGE`** of the prey.
+- If **`walls + drones >= COMBO_CAPTURE_NEED`** (default 4), the **hold counter** increments; otherwise it resets to `0`.
+- When the hold counter reaches **`CAPTURE_HOLD_STEPS`** (~2 s at 60 FPS), tactical state becomes **`CAPTURED`**.
 
-Terminal capture condition:
-- largest escape gap `< PHI_ESCAPE_MAX`
-- predator contributors `>= MIN_PREDATOR_CONTRIBUTORS` (currently 4)
-- condition holds for `T_HOLD` consecutive steps
+**`predators_in_capture_range`** also supplies contributor indices for **`CONTRIBUTOR_BONUS`** (same radius **`R_CAPTURE_RANGE`**).
 
 ## Tactical State Machine
 
-Prey tactical states:
-- `FREE`
-- `THREATENED`
-- `CONTAINED`
-- `CAPTURED`
+Prey tactical states (`PreyTacticalState`):
+- `FREE` — nearest predator beyond `R_DANGER` (with hysteresis via `MARGIN_THREATENED` when leaving `THREATENED`)
+- `THREATENED` — nearest predator within `R_DANGER`
+- `CAPTURED` — terminal; set when the distance hold completes
 
-Hysteresis:
-- Enter `CONTAINED` when `gap < PHI_CONTAINED`
-- Leave `CONTAINED` when `gap > PHI_CONTAINED + MARGIN_CONTAINED`
-- Threatened recovery uses `MARGIN_THREATENED`
-
-Global episode state:
+Global episode state (`EpisodeState`):
 - `IN_PURSUIT`
 - `CAPTURED`
 - `TIMEOUT`
+
+Each `step` info dict includes **`capture`**: a **`CaptureStatus`** named tuple `(in_range_count, contributor_indices, hold_counter, wall_count)`.
 
 ## Rewards (Shared Team Reward)
 
@@ -154,22 +145,18 @@ All predators receive the same base team reward per step.
 
 Included terms:
 - Terminal:
-  - capture: `+10`
-  - timeout: `-5`
+  - capture: `+10` (`REWARD_CAPTURE`)
+  - timeout: `-5` (`REWARD_TIMEOUT`)
 - Transitions:
-  - `FREE -> THREATENED`: `+0.5`
-  - `THREATENED -> CONTAINED`: `+1.5`
-  - escape from containment: `-1.0`
-- Maintenance:
-  - containment step: `+0.05`
+  - `FREE → THREATENED`: `+0.5` (`REWARD_THREATENED`)
 - Penalties:
   - obstacle collision: `-0.5` (shared contribution)
   - predator collision: `-0.2` (shared contribution)
-  - idle penalty: small per-step
+  - idle penalty: small per-step when speed below `IDLE_SPEED_THRESHOLD`
 - Shaping:
-  - mean predator-prey distance delta, clipped by `DIST_SHAPING_CLIP`
+  - mean predator–prey distance delta, clipped by `DIST_SHAPING_CLIP`
 - Optional:
-  - tiny contributor bonus for actual capture contributors
+  - tiny per-step **`CONTRIBUTOR_BONUS`** for each predator whose center is within **`R_CAPTURE_RANGE`** (if `CONTRIBUTOR_BONUS_ENABLED`)
 
 ## Observation Vector (Per Predator)
 
@@ -234,6 +221,8 @@ actions = {i: (10.0, 0.0) for i in range(env.num_agents)}
 obs, rewards, terminations, truncations, infos = env.step(actions)
 ```
 
+`infos` includes `episode_state`, `tactical_state`, `step`, and **`capture`** (`CaptureStatus`: drones in ring, contributor indices, hold progress, wall count).
+
 ### PettingZoo parallel env (string-agent)
 
 ```python
@@ -266,15 +255,26 @@ Training script: `train.py` (check `--help` for curriculum, vectorized envs, and
 Run from `env/`:
 
 ```bash
+python -m pytest tests/ -q
+```
+
+Or individually:
+
+```bash
 python tests/test_capture.py
 python tests/test_parallel_api.py
 ```
 
 Coverage:
-- 4 contributors + border-aware enclosure captures after `T_HOLD`
-- 3 contributors does not capture
+- Four drones in the ring, open arena → `CAPTURED` after hold
+- Three drones only, open arena → never `CAPTURED`
+- Three drones + one wall intersecting the blue circle → `CAPTURED` after hold
 - Prey forced exit after `T_HIDE_MAX`
 - PettingZoo `parallel_api_test` and random rollout smoke test
+
+### Manual layout demo (`demo_manual_spawn_test.py`)
+
+Prey starts at arena center with scripted policy effectively off (`prey_speed_factor=0`); **drones push the prey** via a demo-only `ManualPushDemoEnv` physics pass (overlap resolution + light damping). Three bots are stationary; one drone uses **WASD**. **Capture rules are the same as training** (`COMBO_CAPTURE_NEED`, wall + drone combo). Obstacle-free layout.
 
 ## File Map
 
@@ -282,6 +282,7 @@ Coverage:
 env/
 ├── main.py
 ├── demo.py
+├── demo_manual_spawn_test.py
 ├── train.py
 ├── requirements.txt
 ├── tests/
@@ -304,4 +305,5 @@ env/
 
 - If you want exactly 4 learning predators, set `DRONE_COUNT = 4` in `config.py`.
 - Agent names in `PursuitParallelEnv` are generated from `DRONE_COUNT`.
-- Keep `capture.py` as the single source of truth for escape-gap geometry.
+- **`capture.py`** owns the tactical FSM, distance capture hold, and helpers (`predators_in_capture_range`, `walls_intersecting_capture_circle`, `nearest_predator_distance`, `flee_angle_from_nearest_predator`).
+- Checkpoints trained under **older angular capture + reward shaping** are not behaviorally or reward-matched to the current distance-only rules; retrain after changing capture semantics.

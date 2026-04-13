@@ -1,7 +1,5 @@
 """Tunable constants for the V1 pursuit environment."""
 
-import math
-
 # ---------------------------------------------------------------------------
 # Arena
 # ---------------------------------------------------------------------------
@@ -35,20 +33,19 @@ PREY_SPEED = 1.5 * DRONE_SPEED         # 120  (v_prey)
 R_SENSE = 8 * PREY_RADIUS              # 240
 
 # ---------------------------------------------------------------------------
-# Capture geometry (predators + borders only; obstacles excluded in V1)
+# Capture — distance-only ring (no angular gap logic)
 # ---------------------------------------------------------------------------
-R_CAP = 2.5 * PREY_RADIUS              # 75   capture contribution radius
-R_WALL_CAP = 1.5 * PREY_RADIUS         # 45   border counts as blocker when prey is this close
-PHI_ESCAPE_MAX = math.radians(70)       # terminal capture: largest gap must be < this
-MIN_PREDATOR_CONTRIBUTORS = 4          # minimum predators within R_CAP for capture
-T_HOLD = 5                              # consecutive steps the capture condition must hold
+R_CAP = 2.5 * PREY_RADIUS              # 75   base; capture ring is 1.2× this
+R_CAPTURE_RANGE = 1.2 * R_CAP          # 90   predators within this radius count toward capture
+CAPTURE_HOLD_SECONDS = 2.0
+CAPTURE_HOLD_STEPS = int(CAPTURE_HOLD_SECONDS * FPS)
+# Capture hold: (walls intersecting blue circle) + (drones inside R_CAPTURE_RANGE) >= this
+COMBO_CAPTURE_NEED = 4
 
 # ---------------------------------------------------------------------------
-# Tactical FSM thresholds (with hysteresis margins)
+# Tactical FSM (threat proximity only; capture is distance hold above)
 # ---------------------------------------------------------------------------
 R_DANGER = 4 * PREY_RADIUS             # 120  FREE → THREATENED when any predator enters
-PHI_CONTAINED = math.radians(110)       # THREATENED → CONTAINED when gap < this
-MARGIN_CONTAINED = math.radians(15)     # leave CONTAINED only when gap > PHI_CONTAINED + this
 MARGIN_THREATENED = 1.5 * PREY_RADIUS  # leave THREATENED only when nearest predator > R_DANGER + this
 
 # ---------------------------------------------------------------------------
@@ -68,18 +65,13 @@ M_OBSTACLES = 4  # max obstacle slots per predator observation
 REWARD_CAPTURE = 10.0
 REWARD_TIMEOUT = -5.0
 REWARD_THREATENED = 0.5
-REWARD_CONTAINED = 1.5
-REWARD_CONTAINMENT_STEP = 0.05
-REWARD_ESCAPE = -1.0               # prey escapes from CONTAINED → FREE
 PENALTY_OBSTACLE_COLLISION = -0.5
 PENALTY_PREDATOR_COLLISION = -0.2
 PENALTY_IDLE = -0.01               # per step when speed < IDLE_SPEED_THRESHOLD
 IDLE_SPEED_THRESHOLD = 1.0
 
 DIST_SHAPING_CLIP = 0.1            # per-step distance-shaping clipped to [-clip, +clip]
-ENCIRCLEMENT_SHAPING_SCALE = 2.0   # weight for gap-closing shaping (stronger than distance)
-ENCIRCLEMENT_SHAPING_CLIP = 0.2    # per-step encirclement delta clamp
-CONTRIBUTOR_BONUS = 0.02           # tiny per-step bonus for predators within R_CAP
+CONTRIBUTOR_BONUS = 0.02           # tiny per-step bonus for predators within R_CAPTURE_RANGE
 CONTRIBUTOR_BONUS_ENABLED = True
 
 # ---------------------------------------------------------------------------

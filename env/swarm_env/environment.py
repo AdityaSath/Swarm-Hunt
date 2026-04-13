@@ -27,11 +27,13 @@ from swarm_env.obstacle import Obstacle
 from swarm_env.drone import Drone
 from swarm_env.prey import Prey
 from swarm_env.capture import (
-    compute_escape_gap,
-    GapResult,
+    CaptureStatus,
     TacticalFSM,
     PreyTacticalState,
     EpisodeState,
+    nearest_predator_distance,
+    predators_in_capture_range,
+    walls_intersecting_capture_circle,
 )
 from swarm_env.config import (
     ARENA_WIDTH,
@@ -51,16 +53,14 @@ from swarm_env.config import (
     REWARD_CAPTURE,
     REWARD_TIMEOUT,
     REWARD_THREATENED,
-    REWARD_CONTAINED,
-    REWARD_CONTAINMENT_STEP,
-    REWARD_ESCAPE,
     PENALTY_OBSTACLE_COLLISION,
     PENALTY_PREDATOR_COLLISION,
     PENALTY_IDLE,
     IDLE_SPEED_THRESHOLD,
     DIST_SHAPING_CLIP,
-    ENCIRCLEMENT_SHAPING_SCALE,
-    ENCIRCLEMENT_SHAPING_CLIP,
+    R_CAPTURE_RANGE,
+    R_DANGER,
+    COMBO_CAPTURE_NEED,
     CONTRIBUTOR_BONUS,
     CONTRIBUTOR_BONUS_ENABLED,
 )
@@ -189,7 +189,6 @@ class Environment:
 
         # reward bookkeeping
         self._prev_mean_dist: float = 0.0
-        self._prev_gap_ratio: float = 1.0
         self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
 
         # per-step collision flags (set during physics, consumed by rewards)
@@ -218,7 +217,6 @@ class Environment:
         self._init_prey()
 
         self._prev_mean_dist = self._mean_pred_prey_dist()
-        self._prev_gap_ratio = 1.0
         self._prev_tactical = PreyTacticalState.FREE
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
@@ -255,10 +253,10 @@ class Environment:
         self._physics_step()
 
         # 4. capture / FSM
-        gap, tactical = self._update_capture()
+        capture, tactical = self._update_capture()
 
         # 5. rewards
-        rewards = self._compute_rewards(gap, tactical)
+        rewards = self._compute_rewards(capture.contributor_indices, tactical)
 
         # 6. episode termination / truncation
         terminations = {i: False for i in range(n)}
@@ -280,7 +278,7 @@ class Environment:
             "episode_state": self._episode_state,
             "tactical_state": tactical,
             "step": self._step_count,
-            "gap": gap,
+            "capture": capture,
         }
 
         self._prev_tactical = tactical
@@ -363,20 +361,26 @@ class Environment:
 
     # ── capture / FSM ─────────────────────────────────────────────────────
 
-    def _update_capture(self) -> tuple[GapResult, PreyTacticalState]:
+    def _update_capture(self) -> tuple[CaptureStatus, PreyTacticalState]:
         if self.prey is None:
-            dummy = GapResult(2 * math.pi, 0.0, 0, [], 0)
+            dummy = CaptureStatus(0, [], 0, 0)
             return dummy, PreyTacticalState.FREE
 
         px, py = self.prey.position.x, self.prey.position.y
         pred_pos = [(d.position.x, d.position.y) for d in self.drones]
-        gap = compute_escape_gap(px, py, pred_pos, self._width, self._height)
-        tactical = self._fsm.update(gap, pred_pos, px, py)
-        return gap, tactical
+        tactical = self._fsm.update(
+            pred_pos, px, py, float(self._width), float(self._height),
+        )
+        n_in, indices = predators_in_capture_range(px, py, pred_pos, R_CAPTURE_RANGE)
+        w = self._fsm.last_wall_count
+        status = CaptureStatus(n_in, indices, self._fsm.hold_counter, w)
+        return status, tactical
 
     # ── rewards ───────────────────────────────────────────────────────────
 
-    def _compute_rewards(self, gap: GapResult, tactical: PreyTacticalState) -> dict[int, float]:
+    def _compute_rewards(
+        self, contributor_indices: list[int], tactical: PreyTacticalState
+    ) -> dict[int, float]:
         n = len(self.drones)
         shared = 0.0
 
@@ -390,31 +394,12 @@ class Environment:
         prev = self._prev_tactical
         if prev == PreyTacticalState.FREE and tactical == PreyTacticalState.THREATENED:
             shared += REWARD_THREATENED
-        if prev == PreyTacticalState.THREATENED and tactical == PreyTacticalState.CONTAINED:
-            shared += REWARD_CONTAINED
-        if (
-            prev in (PreyTacticalState.CONTAINED, PreyTacticalState.THREATENED)
-            and tactical == PreyTacticalState.FREE
-        ):
-            shared += REWARD_ESCAPE
-
-        # containment maintenance
-        if tactical == PreyTacticalState.CONTAINED:
-            shared += REWARD_CONTAINMENT_STEP
 
         # distance shaping (clipped)
         mean_dist = self._mean_pred_prey_dist()
         delta = self._prev_mean_dist - mean_dist  # positive = got closer
         shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, delta / WORLD_SCALE))
         self._prev_mean_dist = mean_dist
-
-        # encirclement shaping: reward shrinking the prey's largest escape gap
-        gap_ratio = gap.largest_gap / (2 * math.pi)
-        gap_delta = self._prev_gap_ratio - gap_ratio  # positive = gap shrinking = good
-        shared += ENCIRCLEMENT_SHAPING_SCALE * max(
-            -ENCIRCLEMENT_SHAPING_CLIP, min(ENCIRCLEMENT_SHAPING_CLIP, gap_delta)
-        )
-        self._prev_gap_ratio = gap_ratio
 
         # penalties (shared)
         for i in range(n):
@@ -432,7 +417,7 @@ class Environment:
 
         # optional per-agent contributor bonus
         if CONTRIBUTOR_BONUS_ENABLED:
-            for idx in gap.contributor_indices:
+            for idx in contributor_indices:
                 if 0 <= idx < n:
                     rewards[idx] += CONTRIBUTOR_BONUS
 
@@ -585,8 +570,12 @@ class Environment:
             x = random.uniform(margin, self._width - margin)
             y = random.uniform(margin, self._height - margin)
             pred_pos = [(d.position.x, d.position.y) for d in self.drones]
-            gap = compute_escape_gap(x, y, pred_pos, self._width, self._height)
-            if gap.largest_gap >= math.radians(120):
+            n_in, _ = predators_in_capture_range(x, y, pred_pos, R_CAPTURE_RANGE)
+            w = walls_intersecting_capture_circle(
+                x, y, float(self._width), float(self._height), R_CAPTURE_RANGE,
+            )
+            nearest = nearest_predator_distance(x, y, pred_pos)
+            if w + n_in < COMBO_CAPTURE_NEED and nearest > R_DANGER * 0.5:
                 self.prey = Prey(x, y, radius=PREY_RADIUS, speed=prey_speed)
                 return
         self.prey = Prey(self._width / 2, self._height / 2, radius=PREY_RADIUS, speed=prey_speed)

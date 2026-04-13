@@ -1,39 +1,36 @@
 """
-Angular capture geometry and tactical FSM.
+Distance-based capture and tactical FSM.
 
-One model, two callers: terminal capture check and prey escape-gap steering
-both use ``compute_escape_gap``.  Obstacles are excluded from capture geometry
-in V1 — only predator positions and arena borders participate.
+Capture hold: each step, count **arena walls intersecting** the ``R_CAPTURE_RANGE``
+disk around the prey, plus **predators** whose centers are inside that disk.
+If ``walls + drones >= COMBO_CAPTURE_NEED`` for ``CAPTURE_HOLD_STEPS`` consecutive
+steps → CAPTURED.
+
+Threat: FREE ↔ THREATENED uses ``R_DANGER`` (nearest-predator distance).
 """
+
+from __future__ import annotations
 
 import math
 from enum import Enum
 from typing import NamedTuple
 
 from swarm_env.config import (
-    R_CAP,
-    R_WALL_CAP,
-    PHI_ESCAPE_MAX,
-    PHI_CONTAINED,
-    MARGIN_CONTAINED,
+    R_CAPTURE_RANGE,
     R_DANGER,
     MARGIN_THREATENED,
-    MIN_PREDATOR_CONTRIBUTORS,
-    T_HOLD,
-    ARENA_WIDTH,
-    ARENA_HEIGHT,
+    COMBO_CAPTURE_NEED,
+    CAPTURE_HOLD_STEPS,
 )
-
-TWO_PI = 2.0 * math.pi
 
 
 # ── enums ─────────────────────────────────────────────────────────────────
 
+
 class PreyTacticalState(Enum):
     FREE = 0
     THREATENED = 1
-    CONTAINED = 2
-    CAPTURED = 3
+    CAPTURED = 2
 
 
 class EpisodeState(Enum):
@@ -42,93 +39,16 @@ class EpisodeState(Enum):
     TIMEOUT = 2
 
 
-# ── gap result ────────────────────────────────────────────────────────────
+class CaptureStatus(NamedTuple):
+    """Published in env infos each step."""
 
-class GapResult(NamedTuple):
-    largest_gap: float          # radians
-    gap_center_angle: float     # angle pointing into the center of that gap
-    predator_contributors: int  # number of predators within R_CAP
-    contributor_indices: list    # which predator indices are contributors
-    border_blocker_count: int   # how many walls counted as blockers
+    in_range_count: int
+    contributor_indices: list[int]
+    hold_counter: int
+    wall_count: int  # arena edges (0–4) intersecting the R_CAPTURE_RANGE disk
 
 
-# ── core geometry (single implementation) ─────────────────────────────────
-
-def compute_escape_gap(
-    prey_x: float,
-    prey_y: float,
-    predator_positions: list[tuple[float, float]],
-    arena_w: float = ARENA_WIDTH,
-    arena_h: float = ARENA_HEIGHT,
-    r_cap: float = R_CAP,
-    r_wall_cap: float = R_WALL_CAP,
-) -> GapResult:
-    """
-    Compute the largest angular escape gap around the prey.
-
-    Blockers are (a) predators within *r_cap* and (b) arena borders within
-    *r_wall_cap*.  Each blocker is represented as a single angle from the
-    prey's perspective.  The largest gap between consecutive blocker angles
-    (sorted on the unit circle) is returned together with the center angle
-    of that gap.
-
-    Border angles (pygame coords — y increases downward):
-        left wall   → π       right wall  → 0
-        top wall    → −π/2    bottom wall → π/2
-    """
-    blocker_angles: list[float] = []
-    contributor_indices: list[int] = []
-    border_count = 0
-
-    # predator contributors
-    for i, (px, py) in enumerate(predator_positions):
-        dx = px - prey_x
-        dy = py - prey_y
-        dist = math.hypot(dx, dy)
-        if dist <= r_cap:
-            blocker_angles.append(math.atan2(dy, dx))
-            contributor_indices.append(i)
-
-    # border blockers
-    if prey_x <= r_wall_cap:                    # left wall
-        blocker_angles.append(math.pi)
-        border_count += 1
-    if arena_w - prey_x <= r_wall_cap:          # right wall
-        blocker_angles.append(0.0)
-        border_count += 1
-    if prey_y <= r_wall_cap:                    # top wall
-        blocker_angles.append(-math.pi / 2)
-        border_count += 1
-    if arena_h - prey_y <= r_wall_cap:          # bottom wall
-        blocker_angles.append(math.pi / 2)
-        border_count += 1
-
-    n_pred = len(contributor_indices)
-
-    if not blocker_angles:
-        return GapResult(TWO_PI, 0.0, n_pred, contributor_indices, border_count)
-
-    if len(blocker_angles) == 1:
-        a = blocker_angles[0]
-        gap_center = a + math.pi  # opposite side
-        gap_center = math.atan2(math.sin(gap_center), math.cos(gap_center))
-        return GapResult(TWO_PI, gap_center, n_pred, contributor_indices, border_count)
-
-    # sort and wrap
-    blocker_angles.sort()
-    max_gap = 0.0
-    max_gap_center = 0.0
-
-    for j in range(len(blocker_angles)):
-        a1 = blocker_angles[j]
-        a2 = blocker_angles[(j + 1) % len(blocker_angles)]
-        gap = (a2 - a1) % TWO_PI
-        if gap > max_gap:
-            max_gap = gap
-            center = a1 + gap / 2
-            max_gap_center = math.atan2(math.sin(center), math.cos(center))
-
-    return GapResult(max_gap, max_gap_center, n_pred, contributor_indices, border_count)
+# ── geometry helpers ──────────────────────────────────────────────────────
 
 
 def nearest_predator_distance(
@@ -145,75 +65,128 @@ def nearest_predator_distance(
     return best
 
 
-# ── tactical FSM (with hysteresis) ────────────────────────────────────────
+def predators_in_capture_range(
+    prey_x: float,
+    prey_y: float,
+    predator_positions: list[tuple[float, float]],
+    radius: float = R_CAPTURE_RANGE,
+) -> tuple[int, list[int]]:
+    """Count predators whose center is within *radius* of prey; return indices."""
+    indices: list[int] = []
+    for i, (px, py) in enumerate(predator_positions):
+        if math.hypot(px - prey_x, py - prey_y) <= radius:
+            indices.append(i)
+    return len(indices), indices
+
+
+def walls_intersecting_capture_circle(
+    prey_x: float,
+    prey_y: float,
+    arena_w: float,
+    arena_h: float,
+    circle_r: float = R_CAPTURE_RANGE,
+) -> int:
+    """
+    Count rectangular arena edges whose perpendicular distance to the prey
+    center is at most *circle_r* (the blue capture disk reaches that wall).
+    """
+    n = 0
+    if prey_x <= circle_r:
+        n += 1
+    if arena_w - prey_x <= circle_r:
+        n += 1
+    if prey_y <= circle_r:
+        n += 1
+    if arena_h - prey_y <= circle_r:
+        n += 1
+    return n
+
+
+def flee_angle_from_nearest_predator(
+    prey_x: float,
+    prey_y: float,
+    predator_positions: list[tuple[float, float]],
+) -> float | None:
+    """Unit direction *away* from nearest predator, as atan2 angle; None if empty."""
+    best_d = float("inf")
+    best: tuple[float, float] | None = None
+    for px, py in predator_positions:
+        d = math.hypot(px - prey_x, py - prey_y)
+        if d < best_d:
+            best_d = d
+            best = (px, py)
+    if best is None:
+        return None
+    dx = prey_x - best[0]
+    dy = prey_y - best[1]
+    if dx == 0.0 and dy == 0.0:
+        return None
+    return math.atan2(dy, dx)
+
+
+# ── tactical FSM ──────────────────────────────────────────────────────────
+
 
 class TacticalFSM:
     """
-    Tracks prey tactical state (FREE → THREATENED → CONTAINED → CAPTURED)
-    with configurable hysteresis margins to prevent flicker.
+    FREE ↔ THREATENED (``R_DANGER``).  CAPTURED when
+    ``walls_intersecting_capture_circle + drones_in_R_CAPTURE_RANGE >= COMBO_CAPTURE_NEED``
+    for ``CAPTURE_HOLD_STEPS`` consecutive steps.
     """
 
     def __init__(self) -> None:
         self.state = PreyTacticalState.FREE
         self._hold_counter = 0
+        self._last_wall_count = 0
 
     def reset(self) -> None:
         self.state = PreyTacticalState.FREE
         self._hold_counter = 0
+        self._last_wall_count = 0
+
+    @property
+    def hold_counter(self) -> int:
+        return self._hold_counter
+
+    @property
+    def last_wall_count(self) -> int:
+        return self._last_wall_count
 
     def update(
         self,
-        gap: GapResult,
         predator_positions: list[tuple[float, float]],
         prey_x: float,
         prey_y: float,
+        arena_w: float,
+        arena_h: float,
     ) -> PreyTacticalState:
-        """
-        Advance the FSM one step and return the new state.
+        if self.state == PreyTacticalState.CAPTURED:
+            return self.state
 
-        Transition rules (with hysteresis):
-            FREE → THREATENED       : any predator within R_DANGER
-            THREATENED → FREE       : nearest predator > R_DANGER + MARGIN_THREATENED
-            THREATENED → CONTAINED  : largest gap < PHI_CONTAINED
-            CONTAINED → THREATENED  : gap > PHI_CONTAINED + MARGIN_CONTAINED
-            CONTAINED → CAPTURED    : gap < PHI_ESCAPE_MAX  AND
-                                      predator_contributors >= MIN_PREDATOR_CONTRIBUTORS
-                                      for T_HOLD consecutive steps
-        """
+        n_in, _ = predators_in_capture_range(prey_x, prey_y, predator_positions)
+        w = walls_intersecting_capture_circle(
+            prey_x, prey_y, arena_w, arena_h, R_CAPTURE_RANGE,
+        )
+        self._last_wall_count = w
+        combined = w + n_in
+        qualifying = combined >= COMBO_CAPTURE_NEED
+
+        if qualifying:
+            self._hold_counter += 1
+        else:
+            self._hold_counter = 0
+
+        if self._hold_counter >= CAPTURE_HOLD_STEPS:
+            self.state = PreyTacticalState.CAPTURED
+            return self.state
+
         nearest = nearest_predator_distance(prey_x, prey_y, predator_positions)
-        lg = gap.largest_gap
-
-        prev = self.state
 
         if self.state == PreyTacticalState.FREE:
             if nearest <= R_DANGER:
                 self.state = PreyTacticalState.THREATENED
-                self._hold_counter = 0
-
         elif self.state == PreyTacticalState.THREATENED:
-            if lg < PHI_CONTAINED:
-                self.state = PreyTacticalState.CONTAINED
-                self._hold_counter = 0
-            elif nearest > R_DANGER + MARGIN_THREATENED:
+            if nearest > R_DANGER + MARGIN_THREATENED:
                 self.state = PreyTacticalState.FREE
-                self._hold_counter = 0
-
-        elif self.state == PreyTacticalState.CONTAINED:
-            if lg > PHI_CONTAINED + MARGIN_CONTAINED:
-                self.state = PreyTacticalState.THREATENED
-                self._hold_counter = 0
-            else:
-                # check terminal capture condition
-                if (
-                    lg < PHI_ESCAPE_MAX
-                    and gap.predator_contributors >= MIN_PREDATOR_CONTRIBUTORS
-                ):
-                    self._hold_counter += 1
-                    if self._hold_counter >= T_HOLD:
-                        self.state = PreyTacticalState.CAPTURED
-                else:
-                    self._hold_counter = 0
-
-        # CAPTURED is terminal — no transitions out
 
         return self.state

@@ -1,8 +1,8 @@
 """
-Scripted prey: desired-velocity dynamics, obstacle hiding, capture.py-based evasion.
+Scripted prey: desired-velocity dynamics, obstacle hiding, distance-based evasion.
 
 The prey is NOT a learning agent in V1.  Its policy is entirely rule-based:
-    1. If threatened → steer toward the largest escape gap (capture.py).
+    1. If threatened → flee away from the nearest predator.
     2. If threatened and an obstacle is nearby → may enter it.
     3. While hidden inside an obstacle → stay until T_HIDE_MAX, then exit.
     4. Otherwise → flee from nearest sensed predator cluster.
@@ -21,7 +21,7 @@ from swarm_env.config import (
     T_HIDE_MAX,
     DT,
 )
-from swarm_env.capture import compute_escape_gap, nearest_predator_distance
+from swarm_env.capture import flee_angle_from_nearest_predator, nearest_predator_distance
 
 
 class Prey:
@@ -100,11 +100,12 @@ class Prey:
         if self.hiding:
             self.hide_steps += 1
             if self.hide_steps >= T_HIDE_MAX:
-                # forced exit: pick escape gap direction and leave
+                # forced exit: flee from nearest predator
                 self.hiding = False
                 self.hide_steps = 0
-                gap = compute_escape_gap(px, py, predator_positions, arena_w, arena_h)
-                self._set_velocity_toward(gap.gap_center_angle)
+                ang = flee_angle_from_nearest_predator(px, py, predator_positions)
+                if ang is not None:
+                    self._set_velocity_toward(ang)
                 return
             if inside:
                 # stay still while hidden and timer hasn't elapsed
@@ -120,8 +121,6 @@ class Prey:
         threatened = nearest <= R_DANGER
 
         if threatened:
-            gap = compute_escape_gap(px, py, predator_positions, arena_w, arena_h)
-
             # consider entering a nearby obstacle to hide
             obs_center = self._nearest_obstacle_center(obstacle_rects)
             if obs_center is not None:
@@ -138,8 +137,9 @@ class Prey:
                     self.velocity = pygame.math.Vector2(0, 0)
                     return
 
-            # flee toward largest escape gap
-            self._set_velocity_toward(gap.gap_center_angle)
+            ang = flee_angle_from_nearest_predator(px, py, predator_positions)
+            if ang is not None:
+                self._set_velocity_toward(ang)
             return
 
         # --- not threatened: gentle wander away from nearest cluster ------
