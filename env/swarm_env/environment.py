@@ -188,7 +188,7 @@ class Environment:
         self._step_count = 0
 
         # reward bookkeeping
-        self._prev_mean_dist: float = 0.0
+        self._prev_predator_distances: list[float] = []
         self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
 
         # per-step collision flags (set during physics, consumed by rewards)
@@ -216,7 +216,7 @@ class Environment:
         self._init_drones()
         self._init_prey()
 
-        self._prev_mean_dist = self._mean_pred_prey_dist()
+        self._prev_predator_distances = self._pred_prey_distances()
         self._prev_tactical = PreyTacticalState.FREE
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
@@ -382,53 +382,59 @@ class Environment:
         self, contributor_indices: list[int], tactical: PreyTacticalState
     ) -> dict[int, float]:
         n = len(self.drones)
-        shared = 0.0
+        rewards = {i: 0.0 for i in range(n)}
+        contributor_set = {idx for idx in contributor_indices if 0 <= idx < n}
+        current_distances = self._pred_prey_distances()
 
         # terminal
         if tactical == PreyTacticalState.CAPTURED:
-            shared += REWARD_CAPTURE
+            for idx in contributor_set:
+                rewards[idx] += REWARD_CAPTURE
         elif self._step_count >= MAX_STEPS:
-            shared += REWARD_TIMEOUT
+            for idx in rewards:
+                rewards[idx] += REWARD_TIMEOUT
 
         # tactical transitions
         prev = self._prev_tactical
         if prev == PreyTacticalState.FREE and tactical == PreyTacticalState.THREATENED:
-            shared += REWARD_THREATENED
+            for idx, distance in enumerate(current_distances):
+                if distance <= R_DANGER:
+                    rewards[idx] += REWARD_THREATENED
 
-        # distance shaping (clipped)
-        mean_dist = self._mean_pred_prey_dist()
-        delta = self._prev_mean_dist - mean_dist  # positive = got closer
-        shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, delta / WORLD_SCALE))
-        self._prev_mean_dist = mean_dist
+        # distance shaping (clipped per predator)
+        for idx, distance in enumerate(current_distances):
+            prev_distance = self._prev_predator_distances[idx]
+            delta = prev_distance - distance  # positive = this predator got closer
+            rewards[idx] += max(
+                -DIST_SHAPING_CLIP,
+                min(DIST_SHAPING_CLIP, delta / WORLD_SCALE),
+            )
+        self._prev_predator_distances = current_distances
 
-        # penalties (shared)
+        # penalties
         for i in range(n):
             if self._obs_collisions[i]:
-                shared += PENALTY_OBSTACLE_COLLISION / n
+                rewards[i] += PENALTY_OBSTACLE_COLLISION
             if self._pred_collisions[i]:
-                shared += PENALTY_PREDATOR_COLLISION / n
+                rewards[i] += PENALTY_PREDATOR_COLLISION
 
         # idle penalty
-        for d in self.drones:
-            if d.velocity.length() < IDLE_SPEED_THRESHOLD:
-                shared += PENALTY_IDLE / n
-
-        rewards = {i: shared for i in range(n)}
+        for idx, drone in enumerate(self.drones):
+            if drone.velocity.length() < IDLE_SPEED_THRESHOLD:
+                rewards[idx] += PENALTY_IDLE
 
         # optional per-agent contributor bonus
         if CONTRIBUTOR_BONUS_ENABLED:
-            for idx in contributor_indices:
-                if 0 <= idx < n:
-                    rewards[idx] += CONTRIBUTOR_BONUS
+            for idx in contributor_set:
+                rewards[idx] += CONTRIBUTOR_BONUS
 
         return rewards
 
-    def _mean_pred_prey_dist(self) -> float:
+    def _pred_prey_distances(self) -> list[float]:
         if self.prey is None or not self.drones:
-            return 0.0
+            return [0.0 for _ in self.drones]
         px, py = self.prey.position.x, self.prey.position.y
-        total = sum(math.hypot(d.position.x - px, d.position.y - py) for d in self.drones)
-        return total / len(self.drones)
+        return [math.hypot(d.position.x - px, d.position.y - py) for d in self.drones]
 
     # ── observations ──────────────────────────────────────────────────────
 

@@ -139,22 +139,23 @@ Global episode state (`EpisodeState`):
 
 Each `step` info dict includes **`capture`**: a **`CaptureStatus`** named tuple `(in_range_count, contributor_indices, hold_counter, wall_count)`.
 
-## Rewards (Shared Team Reward)
+## Rewards (Per-Drone Reward)
 
-All predators receive the same base team reward per step.
+Each predator now receives its own reward based on its own outcome and
+contribution.
 
 Included terms:
 - Terminal:
-  - capture: `+10` (`REWARD_CAPTURE`)
-  - timeout: `-5` (`REWARD_TIMEOUT`)
+  - capture contributors: `+10` (`REWARD_CAPTURE`)
+  - timeout: `-2` (`REWARD_TIMEOUT`) for every predator
 - Transitions:
-  - `FREE → THREATENED`: `+0.5` (`REWARD_THREATENED`)
+  - `FREE → THREATENED`: `+0.0` (`REWARD_THREATENED`) for predators within `R_DANGER`
 - Penalties:
-  - obstacle collision: `-0.5` (shared contribution)
-  - predator collision: `-0.2` (shared contribution)
-  - idle penalty: small per-step when speed below `IDLE_SPEED_THRESHOLD`
+  - obstacle collision: `-0.25` for the predator that hit
+  - predator collision: `-0.10` for each predator involved
+  - idle penalty: `0.0` per-step when speed below `IDLE_SPEED_THRESHOLD`
 - Shaping:
-  - mean predator–prey distance delta, clipped by `DIST_SHAPING_CLIP`
+  - each predator's own prey-distance delta, clipped by `DIST_SHAPING_CLIP`
 - Optional:
   - tiny per-step **`CONTRIBUTOR_BONUS`** for each predator whose center is within **`R_CAPTURE_RANGE`** (if `CONTRIBUTOR_BONUS_ENABLED`)
 
