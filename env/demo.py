@@ -27,7 +27,7 @@ import gymnasium
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Demo trained MATD3 agents")
-    p.add_argument("--checkpoint", type=str, default=None,
+    p.add_argument("--checkpoint", type=str, default="./models/MATD3/MATD3_final.pt",
                    help="Path to .pt file (default: most recent in models/MATD3/)")
     p.add_argument("--prey-speed-factor", type=float, default=1.0)
     p.add_argument("--action-repeat", type=int, default=4,
