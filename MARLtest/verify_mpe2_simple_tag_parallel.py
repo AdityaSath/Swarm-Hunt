@@ -21,8 +21,9 @@ while env.agents:
     obs, rewards, terminations, truncations, infos = env.step(actions)
     for a, r in rewards.items():
         total_reward[a] += float(r)
-        done = {a: terminations[a] or truncations[a] for a in env.agents}
+    done = {a: terminations[a] or truncations[a] for a in env.agents}
     if all(done.values()):
         break
-    print("Episode complete. Total reward:", total_reward)
-    env.close()
+
+print("Episode complete. Total reward:", total_reward)
+env.close()

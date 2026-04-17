@@ -218,12 +218,17 @@ def main() -> None:
                 total_steps += args.num_envs
                 steps += args.num_envs
 
+                done = {
+                    agent_id: np.logical_or(termination[agent_id], truncation[agent_id])
+                    for agent_id in termination
+                }
+
                 memory.save_to_memory(
                     state,
                     cont_actions,
                     reward,
                     next_state,
-                    termination,
+                    done,
                     is_vectorised=True,
                 )
 

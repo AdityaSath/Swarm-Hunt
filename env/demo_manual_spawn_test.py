@@ -119,7 +119,7 @@ def apply_test_layout(env: Environment) -> None:
     env._fsm.reset()
     env._episode_state = EpisodeState.IN_PURSUIT
     env._step_count = 0
-    env._prev_mean_dist = env._mean_pred_prey_dist()
+    env._prev_predator_distances = env._pred_prey_distances()
     env._prev_tactical = PreyTacticalState.FREE
     env._obs_collisions = [False] * len(env.drones)
     env._pred_collisions = [False] * len(env.drones)

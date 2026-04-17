@@ -135,6 +135,12 @@ def main() -> None:
 
             if episode_over and args.episodes > 0 and episode >= args.episodes:
                 running = False
+            elif episode_over and args.episodes > 0:
+                env.reset()
+                episode_over = False
+                episode_msg = ""
+                repeat_left = 0
+                cached_actions = None
 
         # ── render ────────────────────────────────────────────────────────
         screen.fill((30, 30, 40))

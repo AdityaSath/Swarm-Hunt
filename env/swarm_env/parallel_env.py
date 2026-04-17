@@ -15,7 +15,7 @@ import gymnasium
 import numpy as np
 from pettingzoo import ParallelEnv
 
-from swarm_env.config import DRONE_COUNT, DRONE_SPEED
+from swarm_env.config import DRONE_SPEED
 from swarm_env.environment import Environment, OBS_SIZE
 
 
@@ -48,7 +48,7 @@ class PursuitParallelEnv(ParallelEnv):
         self.render_mode = render_mode
         self._action_repeat = max(1, int(action_repeat))
 
-        self.possible_agents = [f"predator_{i}" for i in range(DRONE_COUNT)]
+        self.possible_agents = [f"predator_{i}" for i in range(self._env.num_agents)]
         self.agents = list(self.possible_agents)
 
         self._agent_to_idx = {a: i for i, a in enumerate(self.possible_agents)}
@@ -95,7 +95,7 @@ class PursuitParallelEnv(ParallelEnv):
             for a, v in actions.items()
         }
 
-        cumulative_rew: dict[int, float] = {i: 0.0 for i in range(len(self.possible_agents))}
+        cumulative_rew: dict[int, float] = {i: 0.0 for i in range(self._env.num_agents)}
 
         for _ in range(self._action_repeat):
             obs_int, rew_int, term_int, trunc_int, infos_int = self._env.step(int_actions)
@@ -105,7 +105,7 @@ class PursuitParallelEnv(ParallelEnv):
                 break
 
         obs = {self._idx_to_agent[i]: v for i, v in obs_int.items()}
-        rew = {self._idx_to_agent[i]: cumulative_rew[i] for i in range(len(self.possible_agents))}
+        rew = {self._idx_to_agent[i]: cumulative_rew[i] for i in range(self._env.num_agents)}
         term = {self._idx_to_agent[i]: v for i, v in term_int.items()}
         trunc = {self._idx_to_agent[i]: v for i, v in trunc_int.items()}
         infos = {a: infos_int for a in self.agents}
