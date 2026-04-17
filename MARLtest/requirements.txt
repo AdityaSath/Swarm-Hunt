@@ -10,9 +10,10 @@ torchrl
 vmas
 
 # Multi-agent env + wrappers (Track A)
-pettingzoo
+# MPE2's current releases expect PettingZoo's renamed AgentSelector API.
+pettingzoo>=1.25.0,<2.0.0
 supersuit>=3.9,<4
-mpe2
+mpe2>=1.0.0
 
 # RL library (Track A)
 agilerl
