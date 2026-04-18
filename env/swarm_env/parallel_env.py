@@ -1,7 +1,7 @@
 """
 Thin PettingZoo ParallelEnv wrapper over the V1 pursuit core.
 
-Maps string agent keys (``predator_0`` … ``predator_7``) to the core's
+Maps string agent keys (``predator_0`` … ``predator_{N-1}``, ``N = DRONE_COUNT``) to the core's
 integer indices and exposes Gymnasium ``Box`` spaces for observations and
 actions.
 """

@@ -29,13 +29,15 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
 from swarm_env.parallel_env import PursuitParallelEnv
+from swarm_env.config import PREY_BOUNCE_SPEED_SCALE
 
 CURRICULUM_STAGES = [
-    {"prey_speed_factor": 0.5, "label": "Stage 1 (prey 0.5x)"},
+    {"prey_speed_factor": 0.25, "label": "Stage 0 (prey 0.25x — warmup)"},
+    {"prey_speed_factor": 0.5,  "label": "Stage 1 (prey 0.5x)"},
     {"prey_speed_factor": 0.75, "label": "Stage 2 (prey 0.75x)"},
-    {"prey_speed_factor": 1.0, "label": "Stage 3 (prey 1.0x — full)"},
+    {"prey_speed_factor": 1.0,  "label": "Stage 3 (prey 1.0x — full)"},
 ]
-CURRICULUM_ADVANCE_RATE = 0.30
+CURRICULUM_ADVANCE_RATE = 0.20
 CURRICULUM_WINDOW = 100
 
 
@@ -69,9 +71,16 @@ def make_env(action_repeat: int, prey_speed_factor: float):
     return _thunk
 
 
-def build_vec_env(num_envs: int, action_repeat: int, prey_speed_factor: float):
+def build_vec_env(
+    num_envs: int,
+    action_repeat: int,
+    prey_speed_factor: float,
+):
     env = AsyncPettingZooVecEnv(
-        [make_env(action_repeat, prey_speed_factor) for _ in range(num_envs)]
+        [
+            make_env(action_repeat, prey_speed_factor)
+            for _ in range(num_envs)
+        ]
     )
     env.reset()
     return env
@@ -94,7 +103,11 @@ def main() -> None:
     prey_speed_factor = stages[current_stage]["prey_speed_factor"]
 
     # ── environment ───────────────────────────────────────────────────────
-    env = build_vec_env(args.num_envs, args.action_repeat, prey_speed_factor)
+    env = build_vec_env(
+        args.num_envs,
+        args.action_repeat,
+        prey_speed_factor,
+    )
 
     observation_spaces = [env.single_observation_space(agent) for agent in env.agents]
     action_spaces = [env.single_action_space(agent) for agent in env.agents]
@@ -195,6 +208,10 @@ def main() -> None:
           f"num_envs={args.num_envs}  |  pop_size={args.pop_size}  |  "
           f"action_repeat={args.action_repeat}")
     print(f"Curriculum: {stages[current_stage]['label']}")
+    print(
+        "Prey: wall-bouncing ball (center spawn, random heading; "
+        f"speed scale {PREY_BOUNCE_SPEED_SCALE:.1f}× from config)"
+    )
     pbar = trange(args.max_steps, unit="step")
 
     while np.less([agent.steps[-1] for agent in pop], args.max_steps).all():
@@ -295,7 +312,11 @@ def main() -> None:
             print(f"\n*** CURRICULUM ADVANCE -> {stages[current_stage]['label']} "
                   f"(capture rate {recent_capture_rate:.0%}) ***")
             env.close()
-            env = build_vec_env(args.num_envs, args.action_repeat, prey_speed_factor)
+            env = build_vec_env(
+                args.num_envs,
+                args.action_repeat,
+                prey_speed_factor,
+            )
             recent_outcomes.clear()
 
         # ── TensorBoard logging ──────────────────────────────────────────

@@ -17,7 +17,7 @@ MAX_STEPS = 30 * FPS  # episode truncation: 30 s wall-clock at nominal FPS
 # ---------------------------------------------------------------------------
 # Predators
 # ---------------------------------------------------------------------------
-DRONE_COUNT = 8
+DRONE_COUNT = 6
 DRONE_RADIUS = 15
 DRONE_SPEED = 80.0  # v_pred — max speed, clips desired-velocity magnitude
 
@@ -25,7 +25,10 @@ DRONE_SPEED = 80.0  # v_pred — max speed, clips desired-velocity magnitude
 # Prey
 # ---------------------------------------------------------------------------
 PREY_RADIUS = 2 * DRONE_RADIUS         # 30
-PREY_SPEED = 1.5 * DRONE_SPEED         # 120  (v_prey)
+# Slightly faster than predators so pursuit stays challenging but physically reachable
+PREY_SPEED = 1.05 * DRONE_SPEED
+# Bouncing prey speed = PREY_SPEED * prey_speed_factor * this (wall reflections in arena)
+PREY_BOUNCE_SPEED_SCALE = 0.2
 
 # ---------------------------------------------------------------------------
 # Sensing (radius-only, no LOS, obstacles do not block)
@@ -40,18 +43,13 @@ R_CAPTURE_RANGE = 1.2 * R_CAP          # 90   predators within this radius count
 CAPTURE_HOLD_SECONDS = 2.0
 CAPTURE_HOLD_STEPS = int(CAPTURE_HOLD_SECONDS * FPS)
 # Capture hold: (walls intersecting blue circle) + (drones inside R_CAPTURE_RANGE) >= this
-COMBO_CAPTURE_NEED = 4
+COMBO_CAPTURE_NEED = 3
 
 # ---------------------------------------------------------------------------
 # Tactical FSM (threat proximity only; capture is distance hold above)
 # ---------------------------------------------------------------------------
 R_DANGER = 4 * PREY_RADIUS             # 120  FREE → THREATENED when any predator enters
 MARGIN_THREATENED = 1.5 * PREY_RADIUS  # leave THREATENED only when nearest predator > R_DANGER + this
-
-# ---------------------------------------------------------------------------
-# Prey hiding
-# ---------------------------------------------------------------------------
-T_HIDE_MAX = 20  # max steps prey may stay inside an obstacle
 
 # ---------------------------------------------------------------------------
 # Observation layout
@@ -65,13 +63,24 @@ M_OBSTACLES = 4  # max obstacle slots per predator observation
 REWARD_CAPTURE = 10.0
 REWARD_TIMEOUT = -5.0
 REWARD_THREATENED = 0.5
-PENALTY_OBSTACLE_COLLISION = -0.5
-PENALTY_PREDATOR_COLLISION = -0.2
-PENALTY_IDLE = -0.01               # per step when speed < IDLE_SPEED_THRESHOLD
-IDLE_SPEED_THRESHOLD = 1.0
+PENALTY_OBSTACLE_COLLISION = -0.35
+PENALTY_PREDATOR_COLLISION = -0.15
+PENALTY_IDLE = -0.004
+IDLE_SPEED_THRESHOLD = 0.5
 
-DIST_SHAPING_CLIP = 0.1            # per-step distance-shaping clipped to [-clip, +clip]
-CONTRIBUTOR_BONUS = 0.02           # tiny per-step bonus for predators within R_CAPTURE_RANGE
+# Distance shaping (per predator only; no team-average term)
+DIST_SHAPING_CLIP = 0.12
+PER_AGENT_DIST_SHAPING_WEIGHT = 1.0
+
+# Dense bonus for moving toward prey (velocity vs unit vector prey - predator)
+REWARD_VELOCITY_TOWARD_PREY = 0.018
+VELOCITY_TOWARD_MIN_DIST = 20.0  # skip when essentially on top of prey (avoids noise)
+
+# Soft penalty for hugging arena walls (reduces corner camping)
+BOUNDARY_MARGIN_PENALTY = 48.0
+PENALTY_BOUNDARY_PROXIMITY = -0.018
+
+CONTRIBUTOR_BONUS = 0.04
 CONTRIBUTOR_BONUS_ENABLED = True
 
 # ---------------------------------------------------------------------------

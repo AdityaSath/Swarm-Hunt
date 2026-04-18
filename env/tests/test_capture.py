@@ -1,17 +1,14 @@
 """
-Tests for distance-based combo capture FSM and prey hiding.
+Tests for distance-based combo capture FSM.
 
 Scenario A: 4 predators inside R_CAPTURE_RANGE, open arena → CAPTURED after hold
 Scenario B: only 3 predators, no walls → never CAPTURED
 Scenario C: 3 predators + 1 wall intersecting blue circle → CAPTURED after hold
-Scenario D: prey hiding longer than T_HIDE_MAX → forced exit
 """
 
 import math
 import os
 import sys
-
-import pygame
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -21,11 +18,8 @@ from swarm_env.config import (
     R_CAPTURE_RANGE,
     CAPTURE_HOLD_STEPS,
     COMBO_CAPTURE_NEED,
-    T_HIDE_MAX,
-    PREY_RADIUS,
 )
 from swarm_env.capture import TacticalFSM, PreyTacticalState, walls_intersecting_capture_circle
-from swarm_env.prey import Prey
 
 
 def _make_positions_around(
@@ -66,11 +60,12 @@ def test_capture_4_drones_open_arena():
     assert state == PreyTacticalState.CAPTURED
 
 
-def test_no_capture_3_drones_open_arena():
+def test_no_capture_below_combo_open_arena():
+    """Only COMBO_CAPTURE_NEED-1 predators in the ring, no walls -> never CAPTURED."""
     prey_x = ARENA_WIDTH / 2
     prey_y = ARENA_HEIGHT / 2
     dist = R_CAPTURE_RANGE * 0.5
-    preds = _make_positions_around(prey_x, prey_y, 3, dist)
+    preds = _make_positions_around(prey_x, prey_y, COMBO_CAPTURE_NEED - 1, dist)
 
     fsm = TacticalFSM()
     for _ in range(CAPTURE_HOLD_STEPS * 3):
@@ -78,14 +73,14 @@ def test_no_capture_3_drones_open_arena():
         assert state != PreyTacticalState.CAPTURED
 
 
-def test_capture_3_drones_plus_wall():
-    """Prey near left wall so one wall intersects blue circle; 3 drones in ring → 1+3=4."""
+def test_capture_with_wall_assist():
+    """Prey near left wall so one wall intersects blue circle; (NEED-1) drones in ring."""
     prey_x = R_CAPTURE_RANGE * 0.45
     prey_y = ARENA_HEIGHT / 2
     assert walls_intersecting_capture_circle(prey_x, prey_y, ARENA_WIDTH, ARENA_HEIGHT) >= 1
 
     dist = R_CAPTURE_RANGE * 0.5
-    preds = _make_positions_around(prey_x, prey_y, 3, dist)
+    preds = _make_positions_around(prey_x, prey_y, COMBO_CAPTURE_NEED - 1, dist)
 
     fsm = TacticalFSM()
     for step in range(CAPTURE_HOLD_STEPS - 1):
@@ -95,41 +90,14 @@ def test_capture_3_drones_plus_wall():
     assert state == PreyTacticalState.CAPTURED
 
 
-def test_prey_forced_exit_after_hide_max():
-    pygame.init()
-
-    prey = Prey(100, 100, radius=PREY_RADIUS)
-    obs_rect = pygame.Rect(50, 50, 100, 100)
-    obstacle_rects = [obs_rect]
-    pred_positions = [(200, 100)]
-
-    prey.hiding = True
-    prey.hide_steps = 0
-    prey.velocity = pygame.math.Vector2(0, 0)
-
-    for step in range(T_HIDE_MAX + 5):
-        prey.decide(pred_positions, obstacle_rects, ARENA_WIDTH, ARENA_HEIGHT)
-        if step < T_HIDE_MAX - 1:
-            assert prey.hiding or prey.velocity.length() > 0
-        if step == T_HIDE_MAX - 1:
-            assert not prey.hiding
-            assert prey.velocity.length() > 0
-            break
-
-    pygame.quit()
-
-
 if __name__ == "__main__":
     test_capture_4_drones_open_arena()
     print("PASS: Scenario A — 4 drones, open arena")
 
-    test_no_capture_3_drones_open_arena()
-    print("PASS: Scenario B — 3 drones only, no capture")
+    test_no_capture_below_combo_open_arena()
+    print("PASS: Scenario B — sub-combo drones only, no capture")
 
-    test_capture_3_drones_plus_wall()
-    print("PASS: Scenario C — 3 drones + wall → capture")
-
-    test_prey_forced_exit_after_hide_max()
-    print("PASS: Scenario D — T_HIDE_MAX forced exit")
+    test_capture_with_wall_assist()
+    print("PASS: Scenario C — drones + wall → capture")
 
     print("\nAll targeted tests passed.")

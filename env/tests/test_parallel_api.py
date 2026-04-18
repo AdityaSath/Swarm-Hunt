@@ -18,7 +18,7 @@ def test_parallel_api():
 def test_random_episode():
     env = PursuitParallelEnv(seed=0)
     obs, _ = env.reset(seed=0)
-    assert len(obs) == 8
+    assert len(obs) == 6
     total_steps = 0
     while env.agents:
         actions = {a: env.action_space(a).sample() for a in env.agents}

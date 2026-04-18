@@ -2,7 +2,7 @@
 
 A 2D continuous multi-agent pursuit environment with:
 - Learning agents: predator drones
-- Scripted agent: one prey
+- Non-learning prey: bouncing ball (wall reflection)
 - API target: PettingZoo Parallel (`PursuitParallelEnv`)
 - Trainer target: AgileRL
 
@@ -35,6 +35,7 @@ CLI (common options):
 | `--checkpoint` | latest in `models/MATD3/` | Path to `.pt` |
 | `--action-repeat` | `4` | Physics steps per policy decision; match `train.py` |
 | `--prey-speed-factor` | `1.0` | Scales prey speed in the env |
+| `--prey-bounce-scale` | config default | Multiplier on bounce prey speed (`PREY_BOUNCE_SPEED_SCALE`) |
 | `--episodes` | `0` | Auto-exit after N completed episodes (`0` = run until closed) |
 
 Example:
@@ -46,17 +47,16 @@ python demo.py --checkpoint models/MATD3/MATD3_final_12345.pt --action-repeat 4
 ## Current Implemented Defaults
 
 Defined in `swarm_env/config.py`:
-- Predators: `DRONE_COUNT = 8`
+- Predators: `DRONE_COUNT = 6`
 - Prey: `1`
 - `r_prey = 2 * r_pred`
-- `v_prey = 1.5 * v_pred`
+- `v_prey = 1.05 * v_pred` (bouncing prey; effective speed also uses `PREY_BOUNCE_SPEED_SCALE`)
 - `R_SENSE = 8 * r_prey` (team prey sensing / teammate slots)
 - `R_DANGER = 4 * r_prey` (FREE ↔ THREATENED, nearest-predator distance)
 - `R_CAP = 2.5 * r_prey` (legacy base; capture ring is scaled from this)
 - `R_CAPTURE_RANGE = 1.2 * R_CAP` (predators inside this radius count toward capture)
 - `CAPTURE_HOLD_SECONDS = 2.0` → `CAPTURE_HOLD_STEPS = 2 * FPS` (consecutive steps the hold must stay valid)
 - `COMBO_CAPTURE_NEED = 4` (need **walls intersecting blue circle + drones inside `R_CAPTURE_RANGE`** ≥ this to build the hold)
-- `T_HIDE_MAX = 20`
 - `DT = 1 / FPS`, `FPS = 60`
 - `MAX_STEPS = 30 * FPS` (30 seconds)
 
@@ -70,11 +70,10 @@ Defined in `swarm_env/config.py`:
 
 Step order:
 1. Apply predator desired velocities
-2. Scripted prey policy
-3. Physics and collisions
-4. Distance capture check + tactical FSM
-5. Reward computation
-6. Observation assembly
+2. Physics and collisions (prey integrates and bounces on arena edges)
+3. Distance capture check + tactical FSM
+4. Reward computation
+5. Observation assembly
 
 ### Thin PettingZoo adapter
 - File: `swarm_env/parallel_env.py`
@@ -98,19 +97,13 @@ When `actions=None`, the env uses smooth random wandering:
 
 For RL training, always pass explicit actions.
 
-## How Prey Works (Scripted)
+## How Prey Works (Bouncing Ball)
 
 File: `swarm_env/prey.py`
 
-Priority policy:
-1. If threatened: flee **away from the nearest predator** (velocity in the outward radial direction)
-2. If threatened and an obstacle is nearby: may enter obstacle to hide
-3. If hidden: remain hidden up to `T_HIDE_MAX`, then forced exit (flee from nearest predator)
-4. Otherwise: gentle wander away from the predator cluster centroid
-
-Physics rule:
-- Prey can pass through obstacles
-- Prey is clamped by arena borders
+- Spawned near the arena center with a random heading; speed is `PREY_SPEED * prey_speed_factor * PREY_BOUNCE_SPEED_SCALE` (see `config.py`).
+- Not a learning agent: velocity changes only via arena **wall reflection** (`Arena.clamp_and_bounce` in `environment.py`).
+- Prey passes through obstacles; only arena edges reflect.
 
 ## Capture Logic (Distance Ring + Hold)
 
@@ -139,24 +132,23 @@ Global episode state (`EpisodeState`):
 
 Each `step` info dict includes **`capture`**: a **`CaptureStatus`** named tuple `(in_range_count, contributor_indices, hold_counter, wall_count)`.
 
-## Rewards (Shared Team Reward)
+## Rewards (per-predator)
 
-All predators receive the same base team reward per step.
+Each agent gets its own scalar each step (no team-average distance term).
 
 Included terms:
 - Terminal:
-  - capture: `+10` (`REWARD_CAPTURE`)
-  - timeout: `-5` (`REWARD_TIMEOUT`)
+  - capture: `+REWARD_CAPTURE` only for predators listed in **`contributor_indices`** (in capture ring)
+  - timeout: `REWARD_TIMEOUT` for **each** predator
 - Transitions:
-  - `FREE → THREATENED`: `+0.5` (`REWARD_THREATENED`)
-- Penalties:
-  - obstacle collision: `-0.5` (shared contribution)
-  - predator collision: `-0.2` (shared contribution)
-  - idle penalty: small per-step when speed below `IDLE_SPEED_THRESHOLD`
-- Shaping:
-  - mean predator–prey distance delta, clipped by `DIST_SHAPING_CLIP`
+  - `FREE → THREATENED`: `+REWARD_THREATENED` only for drones within **`R_DANGER`** of the prey
+- Penalties (only the involved drone):
+  - obstacle collision, predator–predator collision, idle (speed below threshold), boundary proximity
+- Shaping (per drone):
+  - own distance-to-prey delta, clipped by `DIST_SHAPING_CLIP`
+  - bonus when velocity points toward prey (outside `VELOCITY_TOWARD_MIN_DIST`)
 - Optional:
-  - tiny per-step **`CONTRIBUTOR_BONUS`** for each predator whose center is within **`R_CAPTURE_RANGE`** (if `CONTRIBUTOR_BONUS_ENABLED`)
+  - per-step **`CONTRIBUTOR_BONUS`** when center is within **`R_CAPTURE_RANGE`** (if `CONTRIBUTOR_BONUS_ENABLED`)
 
 ## Observation Vector (Per Predator)
 
@@ -203,7 +195,7 @@ Sensing rule:
 - Env clips to `DRONE_SPEED`
 
 ### PettingZoo `PursuitParallelEnv`
-- Agents: `predator_0` ... `predator_7`
+- Agents: `predator_0` ... `predator_5` (when `DRONE_COUNT = 6`)
 - `action_space(agent) = Box(low=-DRONE_SPEED, high=DRONE_SPEED, shape=(2,), dtype=float32)`
 - `observation_space(agent) = Box(shape=(OBS_SIZE,), dtype=float32)`
 
@@ -269,12 +261,11 @@ Coverage:
 - Four drones in the ring, open arena → `CAPTURED` after hold
 - Three drones only, open arena → never `CAPTURED`
 - Three drones + one wall intersecting the blue circle → `CAPTURED` after hold
-- Prey forced exit after `T_HIDE_MAX`
 - PettingZoo `parallel_api_test` and random rollout smoke test
 
 ### Manual layout demo (`demo_manual_spawn_test.py`)
 
-Prey starts at arena center with scripted policy effectively off (`prey_speed_factor=0`); **drones push the prey** via a demo-only `ManualPushDemoEnv` physics pass (overlap resolution + light damping). Three bots are stationary; one drone uses **WASD**. **Capture rules are the same as training** (`COMBO_CAPTURE_NEED`, wall + drone combo). Obstacle-free layout.
+Prey starts at arena center with zero velocity (`prey_speed_factor=0`); **drones push the prey** via a demo-only `ManualPushDemoEnv` physics pass (overlap resolution + light damping). Three bots are stationary; one drone uses **WASD**. **Capture rules are the same as training** (`COMBO_CAPTURE_NEED`, wall + drone combo). Obstacle-free layout.
 
 ## File Map
 
