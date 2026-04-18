@@ -45,14 +45,18 @@ from swarm_env.config import (
     PREY_SPEED,
     OBSTACLE_POSITIONS,
     DT,
+    FPS,
     MAX_STEPS,
     R_SENSE,
     K_TEAMMATES,
     M_OBSTACLES,
     WORLD_SCALE,
-    REWARD_CAPTURE,
+    REWARD_CAPTURE_TEAM,
+    REWARD_CAPTURE_CONTRIBUTOR,
     REWARD_TIMEOUT,
     REWARD_THREATENED,
+    REWARD_COMBINED_PROGRESS,
+    REWARD_HOLD_PROGRESS,
     PENALTY_OBSTACLE_COLLISION,
     PENALTY_PREDATOR_COLLISION,
     PENALTY_IDLE,
@@ -171,25 +175,36 @@ class Environment:
         dt: float = DT,
         seed: int | None = None,
         prey_speed_factor: float = 1.0,
+        enable_obstacles: bool = True,
+        always_visible: bool = False,
+        capture_hold_seconds: float | None = None,
     ):
         self.dt = dt
         self._width = width
         self._height = height
         self._drone_count = drone_count
         self._prey_speed_factor = max(0.0, prey_speed_factor)
+        self._enable_obstacles = enable_obstacles
+        self._always_visible = always_visible
         self.arena = Arena(width, height)
 
         self.obstacles: list[Obstacle] = []
         self.drones: list[Drone] = []
         self.prey: Prey | None = None
 
-        self._fsm = TacticalFSM()
+        if capture_hold_seconds is None:
+            self._fsm = TacticalFSM()
+        else:
+            capture_hold_steps = max(1, int(capture_hold_seconds * FPS))
+            self._fsm = TacticalFSM(capture_hold_steps=capture_hold_steps)
         self._episode_state = EpisodeState.IN_PURSUIT
         self._step_count = 0
 
         # reward bookkeeping
         self._prev_predator_distances: list[float] = []
         self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
+        self._prev_capture_combined = 0
+        self._prev_hold_counter = 0
 
         # per-step collision flags (set during physics, consumed by rewards)
         self._obs_collisions: list[bool] = []
@@ -218,6 +233,8 @@ class Environment:
 
         self._prev_predator_distances = self._pred_prey_distances()
         self._prev_tactical = PreyTacticalState.FREE
+        self._prev_capture_combined = 0
+        self._prev_hold_counter = 0
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
 
@@ -256,7 +273,7 @@ class Environment:
         capture, tactical = self._update_capture()
 
         # 5. rewards
-        rewards = self._compute_rewards(capture.contributor_indices, tactical)
+        rewards = self._compute_rewards(capture, tactical)
 
         # 6. episode termination / truncation
         terminations = {i: False for i in range(n)}
@@ -379,17 +396,24 @@ class Environment:
     # ── rewards ───────────────────────────────────────────────────────────
 
     def _compute_rewards(
-        self, contributor_indices: list[int], tactical: PreyTacticalState
+        self, capture: CaptureStatus, tactical: PreyTacticalState
     ) -> dict[int, float]:
         n = len(self.drones)
         rewards = {i: 0.0 for i in range(n)}
-        contributor_set = {idx for idx in contributor_indices if 0 <= idx < n}
+        contributor_set = {
+            idx for idx in capture.contributor_indices if 0 <= idx < n
+        }
         current_distances = self._pred_prey_distances()
+        current_combined = capture.wall_count + capture.in_range_count
+        combined_delta = current_combined - self._prev_capture_combined
+        hold_delta = capture.hold_counter - self._prev_hold_counter
 
         # terminal
         if tactical == PreyTacticalState.CAPTURED:
+            for idx in rewards:
+                rewards[idx] += REWARD_CAPTURE_TEAM
             for idx in contributor_set:
-                rewards[idx] += REWARD_CAPTURE
+                rewards[idx] += REWARD_CAPTURE_CONTRIBUTOR
         elif self._step_count >= MAX_STEPS:
             for idx in rewards:
                 rewards[idx] += REWARD_TIMEOUT
@@ -397,9 +421,16 @@ class Environment:
         # tactical transitions
         prev = self._prev_tactical
         if prev == PreyTacticalState.FREE and tactical == PreyTacticalState.THREATENED:
-            for idx, distance in enumerate(current_distances):
-                if distance <= R_DANGER:
-                    rewards[idx] += REWARD_THREATENED
+            for idx in rewards:
+                rewards[idx] += REWARD_THREATENED
+
+        # shared team progress toward a valid capture configuration
+        if combined_delta > 0:
+            for idx in rewards:
+                rewards[idx] += REWARD_COMBINED_PROGRESS * combined_delta
+        if hold_delta > 0:
+            for idx in rewards:
+                rewards[idx] += REWARD_HOLD_PROGRESS * hold_delta
 
         # distance shaping (clipped per predator)
         for idx, distance in enumerate(current_distances):
@@ -410,6 +441,8 @@ class Environment:
                 min(DIST_SHAPING_CLIP, delta / WORLD_SCALE),
             )
         self._prev_predator_distances = current_distances
+        self._prev_capture_combined = current_combined
+        self._prev_hold_counter = capture.hold_counter
 
         # penalties
         for i in range(n):
@@ -445,13 +478,7 @@ class Environment:
 
         # Team sensing: if any predator is within R_SENSE of prey, all predators
         # receive full prey-relative features (shared "spotter" information).
-        team_sees_prey = False
-        if self.prey is not None:
-            prx_g, pry_g = self.prey.position.x, self.prey.position.y
-            for d in self.drones:
-                if math.hypot(d.position.x - prx_g, d.position.y - pry_g) <= R_SENSE:
-                    team_sees_prey = True
-                    break
+        team_sees_prey = self._team_sees_prey()
 
         for i, drone in enumerate(self.drones):
             obs = np.zeros(OBS_SIZE, dtype=np.float32)
@@ -539,8 +566,21 @@ class Environment:
     # ── spawn ─────────────────────────────────────────────────────────────
 
     def _init_obstacles(self) -> None:
+        if not self._enable_obstacles:
+            return
         for x, y, size_type in OBSTACLE_POSITIONS:
             self.obstacles.append(Obstacle(x, y, size_type))
+
+    def _team_sees_prey(self) -> bool:
+        if self.prey is None:
+            return False
+        if self._always_visible:
+            return True
+        prx_g, pry_g = self.prey.position.x, self.prey.position.y
+        for d in self.drones:
+            if math.hypot(d.position.x - prx_g, d.position.y - pry_g) <= R_SENSE:
+                return True
+        return False
 
     def _init_drones(self) -> None:
         margin = DRONE_RADIUS * 2.5

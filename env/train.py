@@ -28,12 +28,51 @@ from agilerl.vector.pz_async_vec_env import AsyncPettingZooVecEnv
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
 
+from swarm_env.capture import PreyTacticalState
+from swarm_env.environment import Environment
 from swarm_env.parallel_env import PursuitParallelEnv
 
 CURRICULUM_STAGES = [
-    {"prey_speed_factor": 0.5, "label": "Stage 1 (prey 0.5x)"},
-    {"prey_speed_factor": 0.75, "label": "Stage 2 (prey 0.75x)"},
-    {"prey_speed_factor": 1.0, "label": "Stage 3 (prey 1.0x — full)"},
+    {
+        "label": "Stage 1 (visible, no obstacles, prey 0.35x, hold 1.0s)",
+        "advance_rate": 0.35,
+        "env_kwargs": {
+            "prey_speed_factor": 0.35,
+            "enable_obstacles": False,
+            "always_visible": True,
+            "capture_hold_seconds": 1.0,
+        },
+    },
+    {
+        "label": "Stage 2 (no obstacles, prey 0.5x, hold 1.5s)",
+        "advance_rate": 0.30,
+        "env_kwargs": {
+            "prey_speed_factor": 0.5,
+            "enable_obstacles": False,
+            "always_visible": False,
+            "capture_hold_seconds": 1.5,
+        },
+    },
+    {
+        "label": "Stage 3 (obstacles on, prey 0.75x, hold 2.0s)",
+        "advance_rate": 0.25,
+        "env_kwargs": {
+            "prey_speed_factor": 0.75,
+            "enable_obstacles": True,
+            "always_visible": False,
+            "capture_hold_seconds": 2.0,
+        },
+    },
+    {
+        "label": "Stage 4 (full difficulty)",
+        "advance_rate": 0.20,
+        "env_kwargs": {
+            "prey_speed_factor": 1.0,
+            "enable_obstacles": True,
+            "always_visible": False,
+            "capture_hold_seconds": 2.0,
+        },
+    },
 ]
 CURRICULUM_ADVANCE_RATE = 0.30
 CURRICULUM_WINDOW = 100
@@ -55,26 +94,125 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-dir", type=str, default="./runs")
     p.add_argument("--save-every", type=int, default=5,
                    help="Save checkpoint every N generations")
+    p.add_argument("--eval-episodes", type=int, default=8,
+                   help="Fixed-seed evaluation episodes per generation")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
-def make_env(action_repeat: int, prey_speed_factor: float):
+def make_env(action_repeat: int, env_kwargs: dict[str, float | bool]):
     """Factory that returns a new PursuitParallelEnv instance."""
     def _thunk():
         return PursuitParallelEnv(
             action_repeat=action_repeat,
-            prey_speed_factor=prey_speed_factor,
+            **env_kwargs,
         )
     return _thunk
 
 
-def build_vec_env(num_envs: int, action_repeat: int, prey_speed_factor: float):
+def build_vec_env(
+    num_envs: int,
+    action_repeat: int,
+    env_kwargs: dict[str, float | bool],
+):
     env = AsyncPettingZooVecEnv(
-        [make_env(action_repeat, prey_speed_factor) for _ in range(num_envs)]
+        [make_env(action_repeat, env_kwargs) for _ in range(num_envs)]
     )
     env.reset()
     return env
+
+
+def evaluate_policy(
+    agent,
+    action_repeat: int,
+    env_kwargs: dict[str, float | bool],
+    episodes: int,
+    base_seed: int,
+) -> dict[str, float]:
+    prev_training = agent.training
+    agent.training = False
+    captures = 0
+    max_holds: list[int] = []
+    max_combined: list[int] = []
+    visible_fracs: list[float] = []
+    visible_alignments: list[float] = []
+    action_norms: list[float] = []
+    threatened_steps = 0
+    total_steps = 0
+
+    try:
+        for ep in range(episodes):
+            env = Environment(seed=base_seed + ep, **env_kwargs)
+            repeat_left = 0
+            cached_actions: dict[int, tuple[float, float]] | None = None
+            ep_visible_steps = 0
+            ep_steps = 0
+            ep_max_hold = 0
+            ep_max_combined = 0
+
+            while True:
+                if repeat_left <= 0:
+                    obs_int = env._compute_observations()
+                    obs = {
+                        agent.agent_ids[i]: value
+                        for i, value in obs_int.items()
+                    }
+                    cont_actions, _ = agent.get_action(obs)
+                    cached_actions = {}
+                    for i, agent_id in enumerate(agent.agent_ids):
+                        action = np.asarray(cont_actions[agent_id]).reshape(-1)
+                        cached_actions[i] = (float(action[0]), float(action[1]))
+                        action_norm = float(np.linalg.norm(action))
+                        action_norms.append(action_norm)
+                        if obs_int[i][4] > 0.5:
+                            rel = np.array([obs_int[i][5], obs_int[i][6]], dtype=np.float32)
+                            rel_norm = float(np.linalg.norm(rel))
+                            if action_norm > 1e-8 and rel_norm > 1e-8:
+                                visible_alignments.append(
+                                    float(np.dot(action, rel) / (action_norm * rel_norm))
+                                )
+                    repeat_left = max(1, action_repeat)
+
+                assert cached_actions is not None
+                _, _, terminations, truncations, infos = env.step(cached_actions)
+                repeat_left -= 1
+                ep_steps += 1
+                total_steps += 1
+
+                if env._team_sees_prey():
+                    ep_visible_steps += 1
+
+                if infos["tactical_state"] == PreyTacticalState.THREATENED:
+                    threatened_steps += 1
+
+                capture = infos["capture"]
+                ep_max_hold = max(ep_max_hold, capture.hold_counter)
+                ep_max_combined = max(
+                    ep_max_combined, capture.wall_count + capture.in_range_count
+                )
+
+                if any(terminations.values()) or any(truncations.values()):
+                    if any(terminations.values()):
+                        captures += 1
+                    break
+
+            max_holds.append(ep_max_hold)
+            max_combined.append(ep_max_combined)
+            visible_fracs.append(ep_visible_steps / max(1, ep_steps))
+    finally:
+        agent.training = prev_training
+
+    return {
+        "capture_rate": captures / max(1, episodes),
+        "max_hold_mean": float(np.mean(max_holds)) if max_holds else 0.0,
+        "max_combined_mean": float(np.mean(max_combined)) if max_combined else 0.0,
+        "visible_frac_mean": float(np.mean(visible_fracs)) if visible_fracs else 0.0,
+        "visible_alignment_mean": (
+            float(np.mean(visible_alignments)) if visible_alignments else 0.0
+        ),
+        "action_norm_mean": float(np.mean(action_norms)) if action_norms else 0.0,
+        "threatened_frac": threatened_steps / max(1, total_steps),
+    }
 
 
 def main() -> None:
@@ -86,15 +224,15 @@ def main() -> None:
 
     # ── curriculum setup ──────────────────────────────────────────────────
     if args.no_curriculum:
-        stages = [{"prey_speed_factor": 1.0, "label": "Full difficulty"}]
+        stages = [CURRICULUM_STAGES[-1]]
     else:
         stages = list(CURRICULUM_STAGES)
 
     current_stage = 0
-    prey_speed_factor = stages[current_stage]["prey_speed_factor"]
+    stage_env_kwargs = dict(stages[current_stage]["env_kwargs"])
 
     # ── environment ───────────────────────────────────────────────────────
-    env = build_vec_env(args.num_envs, args.action_repeat, prey_speed_factor)
+    env = build_vec_env(args.num_envs, args.action_repeat, stage_env_kwargs)
 
     observation_spaces = [env.single_observation_space(agent) for agent in env.agents]
     action_spaces = [env.single_action_space(agent) for agent in env.agents]
@@ -289,18 +427,29 @@ def main() -> None:
             if len(recent_outcomes) >= CURRICULUM_WINDOW
             else 0.0
         )
+        eval_agent = pop[int(np.argmax(fitnesses))]
+        eval_metrics = evaluate_policy(
+            eval_agent,
+            args.action_repeat,
+            stage_env_kwargs,
+            episodes=args.eval_episodes,
+            base_seed=args.seed + 10_000,
+        )
+        stage_advance_rate = stages[current_stage].get(
+            "advance_rate", CURRICULUM_ADVANCE_RATE
+        )
 
         if (
             current_stage < len(stages) - 1
             and len(recent_outcomes) >= CURRICULUM_WINDOW
-            and recent_capture_rate >= CURRICULUM_ADVANCE_RATE
+            and recent_capture_rate >= stage_advance_rate
         ):
             current_stage += 1
-            prey_speed_factor = stages[current_stage]["prey_speed_factor"]
+            stage_env_kwargs = dict(stages[current_stage]["env_kwargs"])
             print(f"\n*** CURRICULUM ADVANCE -> {stages[current_stage]['label']} "
                   f"(capture rate {recent_capture_rate:.0%}) ***")
             env.close()
-            env = build_vec_env(args.num_envs, args.action_repeat, prey_speed_factor)
+            env = build_vec_env(args.num_envs, args.action_repeat, stage_env_kwargs)
             recent_outcomes.clear()
 
         # ── TensorBoard logging ──────────────────────────────────────────
@@ -311,11 +460,57 @@ def main() -> None:
         writer.add_scalar("train/captures_total", captures, total_steps)
         writer.add_scalar("train/timeouts_total", timeouts, total_steps)
         writer.add_scalar("train/curriculum_stage", current_stage, total_steps)
-        writer.add_scalar("train/prey_speed_factor", prey_speed_factor, total_steps)
+        writer.add_scalar(
+            "train/prey_speed_factor",
+            float(stage_env_kwargs["prey_speed_factor"]),
+            total_steps,
+        )
+        writer.add_scalar(
+            "train/obstacles_enabled",
+            float(bool(stage_env_kwargs["enable_obstacles"])),
+            total_steps,
+        )
+        writer.add_scalar(
+            "train/always_visible",
+            float(bool(stage_env_kwargs["always_visible"])),
+            total_steps,
+        )
+        writer.add_scalar(
+            "train/capture_hold_seconds",
+            float(stage_env_kwargs["capture_hold_seconds"]),
+            total_steps,
+        )
         writer.add_scalar(
             "train/wall_time_min", (time.time() - t_start) / 60, total_steps
         )
         writer.add_scalar("train/replay_buffer_size", len(memory), total_steps)
+        writer.add_scalar("eval_fixed/capture_rate", eval_metrics["capture_rate"], total_steps)
+        writer.add_scalar("eval_fixed/max_hold_mean", eval_metrics["max_hold_mean"], total_steps)
+        writer.add_scalar(
+            "eval_fixed/max_combined_mean",
+            eval_metrics["max_combined_mean"],
+            total_steps,
+        )
+        writer.add_scalar(
+            "eval_fixed/visible_frac_mean",
+            eval_metrics["visible_frac_mean"],
+            total_steps,
+        )
+        writer.add_scalar(
+            "eval_fixed/visible_alignment_mean",
+            eval_metrics["visible_alignment_mean"],
+            total_steps,
+        )
+        writer.add_scalar(
+            "eval_fixed/action_norm_mean",
+            eval_metrics["action_norm_mean"],
+            total_steps,
+        )
+        writer.add_scalar(
+            "eval_fixed/threatened_frac",
+            eval_metrics["threatened_frac"],
+            total_steps,
+        )
 
         elapsed = time.time() - t_start
         print(
@@ -324,6 +519,10 @@ def main() -> None:
             f"Cap {captures} | TO {timeouts} | "
             f"Rate {recent_capture_rate:.0%} | "
             f"{stages[current_stage]['label']} | "
+            f"EvalCap {eval_metrics['capture_rate']:.0%} | "
+            f"EvalHold {eval_metrics['max_hold_mean']:.1f} | "
+            f"EvalComb {eval_metrics['max_combined_mean']:.1f} | "
+            f"EvalAlign {eval_metrics['visible_alignment_mean']:.2f} | "
             f"Scores {[f'{s:.1f}' for s in mean_scores]} | "
             f"Fit {[f'{f:.1f}' for f in fitnesses]} | "
             f"{elapsed/60:.1f}m ---"

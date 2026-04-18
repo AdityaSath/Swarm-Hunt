@@ -134,8 +134,14 @@ class TacticalFSM:
     for ``CAPTURE_HOLD_STEPS`` consecutive steps.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        combo_capture_need: int = COMBO_CAPTURE_NEED,
+        capture_hold_steps: int = CAPTURE_HOLD_STEPS,
+    ) -> None:
         self.state = PreyTacticalState.FREE
+        self._combo_capture_need = combo_capture_need
+        self._capture_hold_steps = max(1, int(capture_hold_steps))
         self._hold_counter = 0
         self._last_wall_count = 0
 
@@ -169,14 +175,14 @@ class TacticalFSM:
         )
         self._last_wall_count = w
         combined = w + n_in
-        qualifying = combined >= COMBO_CAPTURE_NEED
+        qualifying = combined >= self._combo_capture_need
 
         if qualifying:
             self._hold_counter += 1
         else:
             self._hold_counter = 0
 
-        if self._hold_counter >= CAPTURE_HOLD_STEPS:
+        if self._hold_counter >= self._capture_hold_steps:
             self.state = PreyTacticalState.CAPTURED
             return self.state
 

@@ -61,9 +61,12 @@ M_OBSTACLES = 4  # max obstacle slots per predator observation
 
 # Rewards
 # ---------------------------------------------------------------------------
-REWARD_CAPTURE = 10.0
+REWARD_CAPTURE_TEAM = 5.0
+REWARD_CAPTURE_CONTRIBUTOR = 5.0
 REWARD_TIMEOUT = -2.0
-REWARD_THREATENED = 0.0
+REWARD_THREATENED = 0.25
+REWARD_COMBINED_PROGRESS = 0.15
+REWARD_HOLD_PROGRESS = 0.02
 REWARD_CONTAINED = 0.0
 REWARD_CONTAINMENT_STEP = 0.0
 REWARD_ESCAPE = 0.0                # prey escapes from CONTAINED → FREE
@@ -72,7 +75,7 @@ PENALTY_PREDATOR_COLLISION = -0.10
 PENALTY_IDLE = 0.0                 # per step when speed < IDLE_SPEED_THRESHOLD
 IDLE_SPEED_THRESHOLD = 1.0
 
-DIST_SHAPING_CLIP = 0.0            # per-step distance-shaping clipped to [-clip, +clip]
+DIST_SHAPING_CLIP = 0.005          # per-step distance-shaping clipped to [-clip, +clip]
 ENCIRCLEMENT_SHAPING_SCALE = 0.0   # weight for gap-closing shaping (stronger than distance)
 ENCIRCLEMENT_SHAPING_CLIP = 0.0    # per-step encirclement delta clamp
 CONTRIBUTOR_BONUS = 0.0            # tiny per-step bonus for predators within R_CAP

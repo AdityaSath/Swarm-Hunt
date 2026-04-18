@@ -146,10 +146,13 @@ contribution.
 
 Included terms:
 - Terminal:
-  - capture contributors: `+10` (`REWARD_CAPTURE`)
+  - all predators on capture: `+5` (`REWARD_CAPTURE_TEAM`)
+  - extra capture contributor bonus: `+5` (`REWARD_CAPTURE_CONTRIBUTOR`)
   - timeout: `-2` (`REWARD_TIMEOUT`) for every predator
-- Transitions:
-  - `FREE → THREATENED`: `+0.0` (`REWARD_THREATENED`) for predators within `R_DANGER`
+- Shared team progress:
+  - `FREE → THREATENED`: `+0.25` (`REWARD_THREATENED`) for every predator
+  - positive change in `(walls + drones in ring)`: `+0.15` per step of improvement (`REWARD_COMBINED_PROGRESS`)
+  - hold-counter progress while a valid capture combo is maintained: `+0.02` per hold step (`REWARD_HOLD_PROGRESS`)
 - Penalties:
   - obstacle collision: `-0.25` for the predator that hit
   - predator collision: `-0.10` for each predator involved
@@ -249,7 +252,7 @@ Typical setup:
 
 Because this env follows PettingZoo Parallel API, it plugs into PettingZoo-compatible AgileRL pipelines directly.
 
-Training script: `train.py` (check `--help` for curriculum, vectorized envs, and other flags). For visual evaluation of a saved policy, use `demo.py` and keep `--action-repeat` consistent with training.
+Training script: `train.py` (check `--help` for curriculum, vectorized envs, fixed-seed evaluation, and other flags). The default curriculum now eases multiple task dimensions, not just prey speed: early stages can disable obstacles, make prey globally visible, and shorten the capture hold. For visual evaluation of a saved policy, use `demo.py` and keep `--action-repeat` consistent with training.
 
 ## Tests
 

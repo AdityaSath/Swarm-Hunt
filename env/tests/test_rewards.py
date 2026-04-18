@@ -5,27 +5,37 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from swarm_env.capture import PreyTacticalState
+from swarm_env.capture import CaptureStatus, PreyTacticalState
 from swarm_env.config import (
+    DIST_SHAPING_CLIP,
     MAX_STEPS,
     PENALTY_OBSTACLE_COLLISION,
     PENALTY_PREDATOR_COLLISION,
-    REWARD_CAPTURE,
+    REWARD_COMBINED_PROGRESS,
+    REWARD_CAPTURE_CONTRIBUTOR,
+    REWARD_CAPTURE_TEAM,
+    REWARD_HOLD_PROGRESS,
+    REWARD_THREATENED,
     REWARD_TIMEOUT,
+    WORLD_SCALE,
 )
 from swarm_env.environment import Environment
 
 
-def test_capture_reward_only_goes_to_contributors():
+def test_capture_reward_is_shared_with_contributor_bonus():
     env = Environment(seed=0)
-    rewards = env._compute_rewards([1, 3], PreyTacticalState.CAPTURED)
+    env._prev_capture_combined = 2
+    rewards = env._compute_rewards(
+        CaptureStatus(in_range_count=2, contributor_indices=[1, 3], hold_counter=0, wall_count=0),
+        PreyTacticalState.CAPTURED,
+    )
 
-    assert rewards[1] == REWARD_CAPTURE
-    assert rewards[3] == REWARD_CAPTURE
+    assert rewards[1] == REWARD_CAPTURE_TEAM + REWARD_CAPTURE_CONTRIBUTOR
+    assert rewards[3] == REWARD_CAPTURE_TEAM + REWARD_CAPTURE_CONTRIBUTOR
 
     for idx, reward in rewards.items():
         if idx not in (1, 3):
-            assert reward == 0.0
+            assert reward == REWARD_CAPTURE_TEAM
 
 
 def test_timeout_and_collision_penalties_are_per_drone():
@@ -36,7 +46,10 @@ def test_timeout_and_collision_penalties_are_per_drone():
     env._obs_collisions[0] = True
     env._pred_collisions[1] = True
 
-    rewards = env._compute_rewards([], PreyTacticalState.FREE)
+    rewards = env._compute_rewards(
+        CaptureStatus(in_range_count=0, contributor_indices=[], hold_counter=0, wall_count=0),
+        PreyTacticalState.FREE,
+    )
 
     assert rewards[0] == REWARD_TIMEOUT + PENALTY_OBSTACLE_COLLISION
     assert rewards[1] == REWARD_TIMEOUT + PENALTY_PREDATOR_COLLISION
@@ -46,7 +59,40 @@ def test_timeout_and_collision_penalties_are_per_drone():
             assert reward == REWARD_TIMEOUT
 
 
+def test_progress_and_threatened_rewards_are_shared():
+    env = Environment(seed=0)
+    env._prev_tactical = PreyTacticalState.FREE
+    env._prev_capture_combined = 1
+    env._prev_hold_counter = 0
+
+    rewards = env._compute_rewards(
+        CaptureStatus(in_range_count=2, contributor_indices=[0, 1], hold_counter=1, wall_count=1),
+        PreyTacticalState.THREATENED,
+    )
+
+    expected = REWARD_THREATENED + (2 * REWARD_COMBINED_PROGRESS) + REWARD_HOLD_PROGRESS
+    for reward in rewards.values():
+        assert reward >= expected
+
+
+def test_distance_shaping_rewards_individual_progress():
+    env = Environment(seed=0)
+    env._prev_predator_distances = [10.0 for _ in env.drones]
+    env._pred_prey_distances = lambda: [9.0] + [10.0 for _ in env.drones[1:]]
+
+    rewards = env._compute_rewards(
+        CaptureStatus(in_range_count=0, contributor_indices=[], hold_counter=0, wall_count=0),
+        PreyTacticalState.FREE,
+    )
+
+    assert rewards[0] == min(DIST_SHAPING_CLIP, 1.0 / WORLD_SCALE)
+    for idx in range(1, len(env.drones)):
+        assert rewards[idx] == 0.0
+
+
 if __name__ == "__main__":
-    test_capture_reward_only_goes_to_contributors()
+    test_capture_reward_is_shared_with_contributor_bonus()
     test_timeout_and_collision_penalties_are_per_drone()
+    test_progress_and_threatened_rewards_are_shared()
+    test_distance_shaping_rewards_individual_progress()
     print("PASS: per-drone reward assignment")

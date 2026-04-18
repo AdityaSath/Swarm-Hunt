@@ -30,7 +30,21 @@ def test_random_episode():
     env.close()
 
 
+def test_curriculum_env_options():
+    env = PursuitParallelEnv(
+        seed=0,
+        enable_obstacles=False,
+        always_visible=True,
+        capture_hold_seconds=0.5,
+    )
+    obs, _ = env.reset(seed=0)
+    assert len(env._env.obstacles) == 0
+    assert all(agent_obs[4] == 1.0 for agent_obs in obs.values())
+    env.close()
+
+
 if __name__ == "__main__":
     test_parallel_api()
     test_random_episode()
+    test_curriculum_env_options()
     print("\nAll PettingZoo tests passed.")

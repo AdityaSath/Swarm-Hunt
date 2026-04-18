@@ -95,6 +95,17 @@ def test_capture_3_drones_plus_wall():
     assert state == PreyTacticalState.CAPTURED
 
 
+def test_capture_with_custom_hold_steps():
+    prey_x = ARENA_WIDTH / 2
+    prey_y = ARENA_HEIGHT / 2
+    preds = _make_positions_around(prey_x, prey_y, COMBO_CAPTURE_NEED, R_CAPTURE_RANGE * 0.5)
+
+    fsm = TacticalFSM(capture_hold_steps=3)
+    for _ in range(2):
+        assert _fsm_step(fsm, preds, prey_x, prey_y) != PreyTacticalState.CAPTURED
+    assert _fsm_step(fsm, preds, prey_x, prey_y) == PreyTacticalState.CAPTURED
+
+
 def test_prey_forced_exit_after_hide_max():
     pygame.init()
 
@@ -128,6 +139,9 @@ if __name__ == "__main__":
 
     test_capture_3_drones_plus_wall()
     print("PASS: Scenario C — 3 drones + wall → capture")
+
+    test_capture_with_custom_hold_steps()
+    print("PASS: Scenario C2 — custom hold steps")
 
     test_prey_forced_exit_after_hide_max()
     print("PASS: Scenario D — T_HIDE_MAX forced exit")
