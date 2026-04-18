@@ -22,9 +22,11 @@ from swarm_env.config import (
     CAPTURE_HOLD_STEPS,
     COMBO_CAPTURE_NEED,
     T_HIDE_MAX,
+    DRONE_RADIUS,
     PREY_RADIUS,
 )
 from swarm_env.capture import TacticalFSM, PreyTacticalState, walls_intersecting_capture_circle
+from swarm_env.environment import Environment
 from swarm_env.prey import Prey
 
 
@@ -53,7 +55,7 @@ def test_capture_4_drones_open_arena():
     """Center prey, four drones in ring → walls=0, drones=4 → combo ≥ need."""
     prey_x = ARENA_WIDTH / 2
     prey_y = ARENA_HEIGHT / 2
-    dist = R_CAPTURE_RANGE * 0.5
+    dist = PREY_RADIUS + DRONE_RADIUS + 10.0
     preds = _make_positions_around(prey_x, prey_y, COMBO_CAPTURE_NEED, dist)
     assert walls_intersecting_capture_circle(prey_x, prey_y, ARENA_WIDTH, ARENA_HEIGHT) == 0
 
@@ -69,7 +71,7 @@ def test_capture_4_drones_open_arena():
 def test_no_capture_3_drones_open_arena():
     prey_x = ARENA_WIDTH / 2
     prey_y = ARENA_HEIGHT / 2
-    dist = R_CAPTURE_RANGE * 0.5
+    dist = PREY_RADIUS + DRONE_RADIUS + 10.0
     preds = _make_positions_around(prey_x, prey_y, 3, dist)
 
     fsm = TacticalFSM()
@@ -84,7 +86,7 @@ def test_capture_3_drones_plus_wall():
     prey_y = ARENA_HEIGHT / 2
     assert walls_intersecting_capture_circle(prey_x, prey_y, ARENA_WIDTH, ARENA_HEIGHT) >= 1
 
-    dist = R_CAPTURE_RANGE * 0.5
+    dist = PREY_RADIUS + DRONE_RADIUS + 10.0
     preds = _make_positions_around(prey_x, prey_y, 3, dist)
 
     fsm = TacticalFSM()
@@ -98,12 +100,40 @@ def test_capture_3_drones_plus_wall():
 def test_capture_with_custom_hold_steps():
     prey_x = ARENA_WIDTH / 2
     prey_y = ARENA_HEIGHT / 2
-    preds = _make_positions_around(prey_x, prey_y, COMBO_CAPTURE_NEED, R_CAPTURE_RANGE * 0.5)
+    preds = _make_positions_around(
+        prey_x,
+        prey_y,
+        COMBO_CAPTURE_NEED,
+        PREY_RADIUS + DRONE_RADIUS + 10.0,
+    )
 
     fsm = TacticalFSM(capture_hold_steps=3)
     for _ in range(2):
         assert _fsm_step(fsm, preds, prey_x, prey_y) != PreyTacticalState.CAPTURED
     assert _fsm_step(fsm, preds, prey_x, prey_y) == PreyTacticalState.CAPTURED
+
+
+def test_contact_capture_immediate():
+    env = Environment(seed=0)
+    env.obstacles.clear()
+    assert env.prey is not None
+
+    px = ARENA_WIDTH / 2
+    py = ARENA_HEIGHT / 2
+    env.prey.position.update(px, py)
+    env.prey.velocity.update(0.0, 0.0)
+    env.prey.decide = lambda *args, **kwargs: None  # noqa: ARG005
+    env.drones[0].position.update(px + PREY_RADIUS + DRONE_RADIUS - 1.0, py)
+    env.drones[0].velocity.update(0.0, 0.0)
+
+    for i, drone in enumerate(env.drones[1:], start=1):
+        drone.position.update(ARENA_WIDTH - 100.0 - i * 40.0, ARENA_HEIGHT - 100.0)
+        drone.velocity.update(0.0, 0.0)
+
+    _, _, terms, _, infos = env.step({i: (0.0, 0.0) for i in range(env.num_agents)})
+    assert any(terms.values())
+    assert infos["tactical_state"] == PreyTacticalState.CAPTURED
+    assert 0 in infos["capture"].contributor_indices
 
 
 def test_prey_forced_exit_after_hide_max():
@@ -142,6 +172,9 @@ if __name__ == "__main__":
 
     test_capture_with_custom_hold_steps()
     print("PASS: Scenario C2 — custom hold steps")
+
+    test_contact_capture_immediate()
+    print("PASS: Scenario C3 — immediate contact capture")
 
     test_prey_forced_exit_after_hide_max()
     print("PASS: Scenario D — T_HIDE_MAX forced exit")

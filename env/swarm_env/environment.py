@@ -209,6 +209,7 @@ class Environment:
         # per-step collision flags (set during physics, consumed by rewards)
         self._obs_collisions: list[bool] = []
         self._pred_collisions: list[bool] = []
+        self._prey_contact_indices: list[int] = []
 
         # demo-mode wandering: persist random velocities across frames
         self._demo_actions: dict[int, tuple[float, float]] = {}
@@ -237,6 +238,7 @@ class Environment:
         self._prev_hold_counter = 0
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
+        self._prey_contact_indices = []
 
         observations = self._compute_observations()
         infos: dict[str, Any] = {"episode_state": self._episode_state, "tactical_state": self._fsm.state}
@@ -330,6 +332,7 @@ class Environment:
     def _physics_step(self) -> None:
         self._obs_collisions = [False] * len(self.drones)
         self._pred_collisions = [False] * len(self.drones)
+        self._prey_contact_indices = []
 
         # integrate predators
         for drone in self.drones:
@@ -376,6 +379,17 @@ class Environment:
                 self.prey.velocity = pygame.math.Vector2(0, 0)
             self.prey.position = clamped
 
+            # Contact capture: any predator touching the prey immediately wins.
+            for idx, drone in enumerate(self.drones):
+                if (
+                    math.hypot(
+                        drone.position.x - self.prey.position.x,
+                        drone.position.y - self.prey.position.y,
+                    )
+                    <= drone.radius + self.prey.radius
+                ):
+                    self._prey_contact_indices.append(idx)
+
     # ── capture / FSM ─────────────────────────────────────────────────────
 
     def _update_capture(self) -> tuple[CaptureStatus, PreyTacticalState]:
@@ -385,10 +399,25 @@ class Environment:
 
         px, py = self.prey.position.x, self.prey.position.y
         pred_pos = [(d.position.x, d.position.y) for d in self.drones]
+        n_in, indices = predators_in_capture_range(px, py, pred_pos, R_CAPTURE_RANGE)
+        w = walls_intersecting_capture_circle(
+            px, py, float(self._width), float(self._height), R_CAPTURE_RANGE,
+        )
+
+        if self._prey_contact_indices:
+            self._fsm._last_wall_count = w
+            tactical = self._fsm.force_capture()
+            status = CaptureStatus(
+                n_in,
+                list(self._prey_contact_indices),
+                self._fsm.hold_counter,
+                w,
+            )
+            return status, tactical
+
         tactical = self._fsm.update(
             pred_pos, px, py, float(self._width), float(self._height),
         )
-        n_in, indices = predators_in_capture_range(px, py, pred_pos, R_CAPTURE_RANGE)
         w = self._fsm.last_wall_count
         status = CaptureStatus(n_in, indices, self._fsm.hold_counter, w)
         return status, tactical

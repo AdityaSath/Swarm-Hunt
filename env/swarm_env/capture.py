@@ -150,6 +150,12 @@ class TacticalFSM:
         self._hold_counter = 0
         self._last_wall_count = 0
 
+    def force_capture(self) -> PreyTacticalState:
+        """Immediately declare capture, bypassing combo/hold logic."""
+        self.state = PreyTacticalState.CAPTURED
+        self._hold_counter = self._capture_hold_steps
+        return self.state
+
     @property
     def hold_counter(self) -> int:
         return self._hold_counter

@@ -116,8 +116,9 @@ Physics rule:
 
 File: `swarm_env/capture.py`
 
-Capture is **distance-based** (no angular gap math).
+Capture is **contact-first, otherwise distance-hold based** (no angular gap math).
 
+- **Immediate contact capture:** if any predator touches the prey (circle overlap), the episode is captured immediately.
 - **`walls_intersecting_capture_circle`**: count arena edges (0–4) whose perpendicular distance to the prey is at most **`R_CAPTURE_RANGE`** (the blue disk touches that wall).
 - **`predators_in_capture_range`**: count predator centers within **`R_CAPTURE_RANGE`** of the prey.
 - If **`walls + drones >= COMBO_CAPTURE_NEED`** (default 4), the **hold counter** increments; otherwise it resets to `0`.
