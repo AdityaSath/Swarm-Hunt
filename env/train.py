@@ -599,8 +599,8 @@ def main() -> None:
             print(f"  [checkpoint] gen {generation} -> {ckpt_path}")
 
     # ── final save ────────────────────────────────────────────────────────
-
-    save_path = os.path.join(args.save_dir, f"MATD3_final.pt")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_path = os.path.join(args.save_dir, f"MATD3_final_{ts}.pt")
     elite.save_checkpoint(save_path)
     print(f"\nElite agent saved to {save_path}")
 
