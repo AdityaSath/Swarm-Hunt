@@ -31,6 +31,7 @@ from tqdm import trange
 from swarm_env.capture import PreyTacticalState
 from swarm_env.environment import Environment
 from swarm_env.parallel_env import PursuitParallelEnv
+from swarm_env.policy_actions import action_to_velocity
 
 CURRICULUM_STAGES = [
     {
@@ -129,6 +130,7 @@ def evaluate_policy(
     episodes: int,
     base_seed: int,
 ) -> dict[str, float]:
+    action_space = _agent_action_space(agent)
     prev_training = agent.training
     agent.training = False
     captures = 0
@@ -136,7 +138,7 @@ def evaluate_policy(
     max_combined: list[int] = []
     visible_fracs: list[float] = []
     visible_alignments: list[float] = []
-    action_norms: list[float] = []
+    action_speeds: list[float] = []
     threatened_steps = 0
     total_steps = 0
 
@@ -161,15 +163,21 @@ def evaluate_policy(
                     cached_actions = {}
                     for i, agent_id in enumerate(agent.agent_ids):
                         action = np.asarray(cont_actions[agent_id]).reshape(-1)
-                        cached_actions[i] = (float(action[0]), float(action[1]))
-                        action_norm = float(np.linalg.norm(action))
-                        action_norms.append(action_norm)
+                        vx, vy = action_to_velocity(action, action_space)
+                        cached_actions[i] = (vx, vy)
+                        action_speed = float(np.hypot(vx, vy))
+                        action_speeds.append(action_speed)
                         if obs_int[i][4] > 0.5:
                             rel = np.array([obs_int[i][5], obs_int[i][6]], dtype=np.float32)
                             rel_norm = float(np.linalg.norm(rel))
-                            if action_norm > 1e-8 and rel_norm > 1e-8:
+                            if action_speed > 1e-8 and rel_norm > 1e-8:
                                 visible_alignments.append(
-                                    float(np.dot(action, rel) / (action_norm * rel_norm))
+                                    float(
+                                        np.dot(
+                                            np.array([vx, vy], dtype=np.float32),
+                                            rel,
+                                        ) / (action_speed * rel_norm)
+                                    )
                                 )
                     repeat_left = max(1, action_repeat)
 
@@ -210,9 +218,37 @@ def evaluate_policy(
         "visible_alignment_mean": (
             float(np.mean(visible_alignments)) if visible_alignments else 0.0
         ),
-        "action_norm_mean": float(np.mean(action_norms)) if action_norms else 0.0,
+        "action_speed_mean": float(np.mean(action_speeds)) if action_speeds else 0.0,
         "threatened_frac": threatened_steps / max(1, total_steps),
     }
+
+
+def _agent_action_space(agent):
+    action_spaces = getattr(agent, "action_spaces", None)
+    if action_spaces:
+        return action_spaces[0]
+
+    action_space = getattr(agent, "action_space", None)
+    if isinstance(action_space, dict) and action_space:
+        return next(iter(action_space.values()))
+
+    raise ValueError("Could not determine agent action space")
+
+
+def _eval_metrics_better(
+    current: dict[str, float],
+    best: dict[str, float] | None,
+) -> bool:
+    if best is None:
+        return True
+
+    for key in ("capture_rate", "max_hold_mean", "max_combined_mean"):
+        if current[key] > best[key]:
+            return True
+        if current[key] < best[key]:
+            return False
+
+    return current["visible_alignment_mean"] > best["visible_alignment_mean"]
 
 
 def main() -> None:
@@ -327,6 +363,8 @@ def main() -> None:
     timeouts = 0
     recent_outcomes: deque[bool] = deque(maxlen=CURRICULUM_WINDOW)
     t_start = time.time()
+    best_eval_metrics: dict[str, float] | None = None
+    best_eval_path = os.path.join(args.save_dir, "MATD3_best.pt")
 
     # ── training loop ─────────────────────────────────────────────────────
     print(f"Training MATD3  |  max_steps={args.max_steps}  |  "
@@ -435,6 +473,17 @@ def main() -> None:
             episodes=args.eval_episodes,
             base_seed=args.seed + 10_000,
         )
+
+        if _eval_metrics_better(eval_metrics, best_eval_metrics):
+            best_eval_metrics = dict(eval_metrics)
+            eval_agent.save_checkpoint(best_eval_path)
+            print(
+                "  [best-eval] "
+                f"cap {eval_metrics['capture_rate']:.0%} | "
+                f"hold {eval_metrics['max_hold_mean']:.1f} | "
+                f"comb {eval_metrics['max_combined_mean']:.1f} -> "
+                f"{best_eval_path}"
+            )
         stage_advance_rate = stages[current_stage].get(
             "advance_rate", CURRICULUM_ADVANCE_RATE
         )
@@ -503,7 +552,12 @@ def main() -> None:
         )
         writer.add_scalar(
             "eval_fixed/action_norm_mean",
-            eval_metrics["action_norm_mean"],
+            eval_metrics["action_speed_mean"],
+            total_steps,
+        )
+        writer.add_scalar(
+            "eval_fixed/action_speed_mean",
+            eval_metrics["action_speed_mean"],
             total_steps,
         )
         writer.add_scalar(
@@ -523,6 +577,7 @@ def main() -> None:
             f"EvalHold {eval_metrics['max_hold_mean']:.1f} | "
             f"EvalComb {eval_metrics['max_combined_mean']:.1f} | "
             f"EvalAlign {eval_metrics['visible_alignment_mean']:.2f} | "
+            f"EvalSpeed {eval_metrics['action_speed_mean']:.1f} | "
             f"Scores {[f'{s:.1f}' for s in mean_scores]} | "
             f"Fit {[f'{f:.1f}' for f in fitnesses]} | "
             f"{elapsed/60:.1f}m ---"

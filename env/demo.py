@@ -19,16 +19,18 @@ import pygame
 import torch
 from agilerl.algorithms.matd3 import MATD3
 
-from swarm_env.config import ARENA_WIDTH, ARENA_HEIGHT, FPS, DT, DRONE_COUNT, DRONE_SPEED
-from swarm_env.environment import Environment, OBS_SIZE
+from swarm_env.config import ARENA_WIDTH, ARENA_HEIGHT, FPS, DT
 from swarm_env.capture import PreyTacticalState
-import gymnasium
+from swarm_env.environment import Environment
+from swarm_env.policy_actions import action_to_velocity
+
+DEFAULT_CHECKPOINT = "./models/MATD3/MATD3_best.pt"
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Demo trained MATD3 agents")
-    p.add_argument("--checkpoint", type=str, default="./models/MATD3/MATD3_final.pt",
-                   help="Path to .pt file (default: most recent in models/MATD3/)")
+    p.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT,
+                   help="Path to .pt file (default: ./models/MATD3/MATD3_best.pt)")
     p.add_argument("--prey-speed-factor", type=float, default=1.0)
     p.add_argument("--action-repeat", type=int, default=4,
                    help="Physics steps per policy decision (match train.py)")
@@ -38,24 +40,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_agent(checkpoint: str, device: torch.device) -> MATD3:
-    agent_ids = [f"predator_{i}" for i in range(DRONE_COUNT)]
-    observation_spaces = [
-        gymnasium.spaces.Box(low=-np.inf, high=np.inf, shape=(OBS_SIZE,), dtype=np.float32)
-        for _ in agent_ids
-    ]
-    action_spaces = [
-        gymnasium.spaces.Box(low=-DRONE_SPEED, high=DRONE_SPEED, shape=(2,), dtype=np.float32)
-        for _ in agent_ids
-    ]
-
-    agent = MATD3(
-        observation_spaces=observation_spaces,
-        action_spaces=action_spaces,
-        agent_ids=agent_ids,
-        device=device,
-    )
-    agent.load_checkpoint(checkpoint)
-    return agent
+    return MATD3.load(checkpoint, device=device)
 
 
 def main() -> None:
@@ -63,7 +48,14 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     checkpoint = args.checkpoint
-    if checkpoint is None:
+    if checkpoint == DEFAULT_CHECKPOINT and not os.path.exists(checkpoint):
+        pts = sorted(glob.glob("./models/MATD3/*.pt"), key=os.path.getmtime)
+        if not pts:
+            print("No checkpoint found in models/MATD3/. Train first.")
+            return
+        checkpoint = pts[-1]
+        print(f"Default best checkpoint not found, using most recent: {checkpoint}")
+    elif checkpoint is None:
         pts = sorted(glob.glob("./models/MATD3/*.pt"), key=os.path.getmtime)
         if not pts:
             print("No checkpoint found in models/MATD3/. Train first.")
@@ -80,9 +72,14 @@ def main() -> None:
     font = pygame.font.Font(None, 36)
     small_font = pygame.font.Font(None, 24)
 
-    env = Environment(dt=DT, prey_speed_factor=args.prey_speed_factor)
-    agent_ids = [f"predator_{i}" for i in range(DRONE_COUNT)]
+    env = Environment(
+        dt=DT,
+        prey_speed_factor=args.prey_speed_factor,
+        drone_count=len(agent.agent_ids),
+    )
+    agent_ids = list(agent.agent_ids)
     idx_to_agent = {i: a for i, a in enumerate(agent_ids)}
+    action_space = agent.action_spaces[0]
 
     episode = 0
     captures = 0
@@ -114,9 +111,9 @@ def main() -> None:
                 obs = {idx_to_agent[i]: v for i, v in obs_int.items()}
                 cont_actions, _ = agent.get_action(obs)
                 cached_actions = {}
-                for i in range(DRONE_COUNT):
+                for i in range(len(agent_ids)):
                     a = cont_actions[idx_to_agent[i]].reshape(-1)
-                    cached_actions[i] = (float(a[0]), float(a[1]))
+                    cached_actions[i] = action_to_velocity(a, action_space)
                 repeat_left = max(1, args.action_repeat)
 
             assert cached_actions is not None

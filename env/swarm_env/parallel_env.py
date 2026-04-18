@@ -15,8 +15,8 @@ import gymnasium
 import numpy as np
 from pettingzoo import ParallelEnv
 
-from swarm_env.config import DRONE_SPEED
 from swarm_env.environment import Environment, OBS_SIZE
+from swarm_env.policy_actions import action_to_velocity, make_policy_action_space
 
 
 class PursuitParallelEnv(ParallelEnv):
@@ -64,9 +64,7 @@ class PursuitParallelEnv(ParallelEnv):
 
     @functools.lru_cache(maxsize=None)
     def action_space(self, agent: str) -> gymnasium.spaces.Box:
-        return gymnasium.spaces.Box(
-            low=-DRONE_SPEED, high=DRONE_SPEED, shape=(2,), dtype=np.float32,
-        )
+        return make_policy_action_space()
 
     # ── reset / step ──────────────────────────────────────────────────────
 
@@ -91,7 +89,10 @@ class PursuitParallelEnv(ParallelEnv):
         dict[str, Any],
     ]:
         int_actions = {
-            self._agent_to_idx[a]: (float(v[0]), float(v[1]))
+            self._agent_to_idx[a]: action_to_velocity(
+                v,
+                self.action_space(a),
+            )
             for a, v in actions.items()
         }
 
