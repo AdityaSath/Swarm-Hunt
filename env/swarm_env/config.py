@@ -60,27 +60,51 @@ M_OBSTACLES = 4  # max obstacle slots per predator observation
 # ---------------------------------------------------------------------------
 # Rewards
 # ---------------------------------------------------------------------------
-REWARD_CAPTURE = 10.0
+# Goal during this training pass: teach drones to CHASE the prey.
+# Polish penalties (boundary / idle / collisions) are softened or zeroed so
+# the per-step pursuit signal dominates the gradient.
+REWARD_CAPTURE = 14.0
 REWARD_TIMEOUT = -5.0
-REWARD_THREATENED = 0.5
-PENALTY_OBSTACLE_COLLISION = -0.35
-PENALTY_PREDATOR_COLLISION = -0.15
-PENALTY_IDLE = -0.004
+REWARD_THREATENED = 0.85
+PENALTY_OBSTACLE_COLLISION = -0.05
+PENALTY_PREDATOR_COLLISION = -0.02
+PENALTY_IDLE = 0.0
 IDLE_SPEED_THRESHOLD = 0.5
 
-# Distance shaping (per predator only; no team-average term)
+# Per-agent dense potential shaping: every step, reward a small *negative* of the
+# normalized distance to prey. Net effect: drones gain reward by being closer,
+# every single step, without telescoping.  Tunable scale.
+DIST_POTENTIAL_WEIGHT = 0.038
+
+# Legacy delta-distance shaping is OFF (replaced by potential above). Kept for
+# reference; weight 0 disables it.
 DIST_SHAPING_CLIP = 0.12
-PER_AGENT_DIST_SHAPING_WEIGHT = 1.0
+PER_AGENT_DIST_SHAPING_WEIGHT = 0.0
 
 # Dense bonus for moving toward prey (velocity vs unit vector prey - predator)
-REWARD_VELOCITY_TOWARD_PREY = 0.018
+REWARD_VELOCITY_TOWARD_PREY = 0.11
 VELOCITY_TOWARD_MIN_DIST = 20.0  # skip when essentially on top of prey (avoids noise)
 
-# Soft penalty for hugging arena walls (reduces corner camping)
-BOUNDARY_MARGIN_PENALTY = 48.0
-PENALTY_BOUNDARY_PROXIMITY = -0.018
+# Stronger pursuit right after spawn (episode step < this at 60 FPS)
+CHASE_BOOTSTRAP_STEPS = 300
+CHASE_BOOTSTRAP_MULT = 3.1
 
-CONTRIBUTOR_BONUS = 0.04
+# When inside the capture contribution radius: reward staying + prefer slow speed so
+# drones can hold the ring without overshooting / oscillating out.
+REWARD_IN_CAPTURE_RING_PER_STEP = 0.028
+REWARD_SLOW_IN_RING = 0.085
+
+# Boundary penalty disabled while learning to chase (re-enable after pursuit works)
+BOUNDARY_MARGIN_PENALTY = 0.0
+PENALTY_BOUNDARY_PROXIMITY = 0.0
+
+# Edge x straggler: penalize border hugging when farther from prey than the team median.
+# e = in-edge-band strength, s = how much farther than median (clamped). Penalty = w*e*s.
+EDGE_STRAGGLER_BAND_PX = 95.0
+PENALTY_EDGE_STRAGGLER = 0.07
+STRAGGLER_DIST_SCALE = 220.0
+
+CONTRIBUTOR_BONUS = 0.065
 CONTRIBUTOR_BONUS_ENABLED = True
 
 # ---------------------------------------------------------------------------

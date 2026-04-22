@@ -58,10 +58,18 @@ from swarm_env.config import (
     IDLE_SPEED_THRESHOLD,
     DIST_SHAPING_CLIP,
     PER_AGENT_DIST_SHAPING_WEIGHT,
+    DIST_POTENTIAL_WEIGHT,
     REWARD_VELOCITY_TOWARD_PREY,
     VELOCITY_TOWARD_MIN_DIST,
+    CHASE_BOOTSTRAP_STEPS,
+    CHASE_BOOTSTRAP_MULT,
+    REWARD_IN_CAPTURE_RING_PER_STEP,
+    REWARD_SLOW_IN_RING,
     BOUNDARY_MARGIN_PENALTY,
     PENALTY_BOUNDARY_PROXIMITY,
+    EDGE_STRAGGLER_BAND_PX,
+    PENALTY_EDGE_STRAGGLER,
+    STRAGGLER_DIST_SCALE,
     R_CAPTURE_RANGE,
     R_DANGER,
     CONTRIBUTOR_BONUS,
@@ -406,19 +414,63 @@ class Environment:
                 if math.hypot(d.position.x - prx, d.position.y - pry) <= R_DANGER:
                     rewards[i] += REWARD_THREATENED
 
-        # Per-agent distance shaping
+        # Per-agent distance shaping (potential-based: -k * dist / WORLD_SCALE).
+        # Every step, a closer drone gets a *less negative* reward.  No
+        # telescoping, so the gradient is consistent across the whole episode.
         cur_dists = self._per_drone_prey_dists()
         for i in range(n):
-            prev_d = self._prev_indiv_dists[i] if i < len(self._prev_indiv_dists) else cur_dists[i]
-            delta_i = prev_d - cur_dists[i]
-            pa = PER_AGENT_DIST_SHAPING_WEIGHT * max(
-                -DIST_SHAPING_CLIP,
-                min(DIST_SHAPING_CLIP, delta_i / WORLD_SCALE),
-            )
-            rewards[i] += pa
+            rewards[i] -= DIST_POTENTIAL_WEIGHT * (cur_dists[i] / WORLD_SCALE)
+
+        # Legacy delta-distance shaping (off by default; weight=0 in config).
+        if PER_AGENT_DIST_SHAPING_WEIGHT != 0.0:
+            for i in range(n):
+                prev_d = (
+                    self._prev_indiv_dists[i]
+                    if i < len(self._prev_indiv_dists)
+                    else cur_dists[i]
+                )
+                delta_i = prev_d - cur_dists[i]
+                pa = PER_AGENT_DIST_SHAPING_WEIGHT * max(
+                    -DIST_SHAPING_CLIP,
+                    min(DIST_SHAPING_CLIP, delta_i / WORLD_SCALE),
+                )
+                rewards[i] += pa
         self._prev_indiv_dists = cur_dists
 
+        # Edge x straggler: corners hurt only when this drone is farther from prey than peers.
+        if (
+            PENALTY_EDGE_STRAGGLER > 0.0
+            and EDGE_STRAGGLER_BAND_PX > 0.0
+            and STRAGGLER_DIST_SCALE > 0.0
+            and self.prey is not None
+            and n >= 2
+        ):
+            median_d = float(np.median(np.asarray(cur_dists, dtype=np.float64)))
+            inv_s = 1.0 / STRAGGLER_DIST_SCALE
+            x_min, y_min, x_max, y_max = self.arena.get_bounds()
+            for i, d in enumerate(self.drones):
+                excess = cur_dists[i] - median_d
+                if excess <= 0.0:
+                    s = 0.0
+                else:
+                    s = min(1.0, excess * inv_s)
+                px, py = d.position.x, d.position.y
+                edge_dist = min(
+                    px - x_min, x_max - px, py - y_min, y_max - py
+                )
+                if edge_dist >= EDGE_STRAGGLER_BAND_PX:
+                    e = 0.0
+                else:
+                    e = 1.0 - (edge_dist / EDGE_STRAGGLER_BAND_PX)
+                    e = max(0.0, min(1.0, e))
+                rewards[i] -= PENALTY_EDGE_STRAGGLER * e * s
+
         # Velocity aligned with prey direction (dense pursuit signal)
+        chase_w = (
+            CHASE_BOOTSTRAP_MULT
+            if self._step_count < CHASE_BOOTSTRAP_STEPS
+            else 1.0
+        )
         if self.prey is not None:
             prx = self.prey.position.x
             pry = self.prey.position.y
@@ -426,13 +478,26 @@ class Environment:
                 dx = prx - d.position.x
                 dy = pry - d.position.y
                 dist = math.hypot(dx, dy)
-                if dist <= VELOCITY_TOWARD_MIN_DIST:
-                    continue
-                ux, uy = dx / dist, dy / dist
                 vx, vy = d.velocity.x, d.velocity.y
-                toward = vx * ux + vy * uy
-                if toward > 0:
-                    rewards[i] += REWARD_VELOCITY_TOWARD_PREY * (toward / DRONE_SPEED)
+
+                # In capture contribution zone: small per-step "hold" + prefer low speed
+                # (policy can use partial velocity — Drone caps max, not min).
+                if dist <= R_CAPTURE_RANGE:
+                    rewards[i] += REWARD_IN_CAPTURE_RING_PER_STEP
+                    spd = math.hypot(vx, vy)
+                    rewards[i] += REWARD_SLOW_IN_RING * (
+                        1.0 - min(1.0, spd / DRONE_SPEED)
+                    )
+
+                if dist > VELOCITY_TOWARD_MIN_DIST:
+                    ux, uy = dx / dist, dy / dist
+                    toward = vx * ux + vy * uy
+                    if toward > 0:
+                        rewards[i] += (
+                            chase_w
+                            * REWARD_VELOCITY_TOWARD_PREY
+                            * (toward / DRONE_SPEED)
+                        )
 
         # Arena boundary proximity (discourage wall hugging / corner lock-in)
         x_min, y_min, x_max, y_max = self.arena.get_bounds()

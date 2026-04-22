@@ -47,9 +47,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-envs", type=int, default=4)
     p.add_argument("--action-repeat", type=int, default=4,
                    help="Env sub-steps per agent decision (frame skip)")
-    p.add_argument("--pop-size", type=int, default=4)
+    p.add_argument("--pop-size", type=int, default=1,
+                   help="AgileRL population size. 1 disables tournament/mutation.")
     p.add_argument("--evo-steps", type=int, default=4000,
-                   help="Steps between evolutionary tournaments")
+                   help="Steps between evolutionary tournaments (ignored when pop-size=1)")
     p.add_argument("--no-cuda", action="store_true")
     p.add_argument("--no-curriculum", action="store_true",
                    help="Disable curriculum (use full prey speed from start)")
@@ -346,8 +347,13 @@ def main() -> None:
         )
 
         # ── evolution ─────────────────────────────────────────────────────
-        elite, pop = tournament.select(pop)
-        pop = mutations.mutation(pop)
+        # Skip tournament + mutation when pop_size=1: nothing to compete with,
+        # and mutations would just shock the only learner.
+        if args.pop_size > 1:
+            elite, pop = tournament.select(pop)
+            pop = mutations.mutation(pop)
+        else:
+            elite = pop[0]
 
         for agent in pop:
             agent.steps.append(agent.steps[-1])

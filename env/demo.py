@@ -96,12 +96,12 @@ def main() -> None:
     _bs = args.prey_bounce_scale if args.prey_bounce_scale is not None else PREY_BOUNCE_SPEED_SCALE
     v = PREY_SPEED * args.prey_speed_factor * _bs
     print(
-        f"Prey: wall-bouncing ball  |  speed ≈ {v:.1f} px/s  (scale {_bs})"
+        f"Prey: wall-bouncing ball  |  speed ~ {v:.1f} px/s  (scale {_bs})"
     )
 
     pygame.init()
     screen = pygame.display.set_mode((ARENA_WIDTH, ARENA_HEIGHT))
-    pygame.display.set_caption("Pursuit V1 — Trained Agent Demo")
+    pygame.display.set_caption("Pursuit V1 - Trained Agent Demo")
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 36)
     small_font = pygame.font.Font(None, 24)
