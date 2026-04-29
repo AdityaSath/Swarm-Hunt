@@ -12,6 +12,7 @@ from swarm_env.config import DRONE_SPEED
 
 POLICY_ACTION_LOW = np.array([-1.0, 0.0], dtype=np.float32)
 POLICY_ACTION_HIGH = np.array([1.0, 1.0], dtype=np.float32)
+MIN_POLICY_THROTTLE = 0.20
 
 
 def make_policy_action_space() -> gymnasium.spaces.Box:
@@ -47,7 +48,9 @@ def policy_action_to_velocity(action: np.ndarray | list[float] | tuple[float, fl
     heading = float(np.clip(arr[0], POLICY_ACTION_LOW[0], POLICY_ACTION_HIGH[0]))
     throttle = float(np.clip(arr[1], POLICY_ACTION_LOW[1], POLICY_ACTION_HIGH[1]))
     angle = heading * math.pi
-    speed = throttle * DRONE_SPEED
+    speed = (
+        MIN_POLICY_THROTTLE + throttle * (1.0 - MIN_POLICY_THROTTLE)
+    ) * DRONE_SPEED
     return speed * math.cos(angle), speed * math.sin(angle)
 
 

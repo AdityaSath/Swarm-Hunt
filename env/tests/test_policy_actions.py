@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from swarm_env.config import DRONE_SPEED
 from swarm_env.policy_actions import (
+    MIN_POLICY_THROTTLE,
     POLICY_ACTION_HIGH,
     POLICY_ACTION_LOW,
     action_to_velocity,
@@ -36,7 +37,7 @@ def test_policy_action_to_velocity_mapping():
     assert math.isclose(vy, DRONE_SPEED, rel_tol=1e-6)
 
     vx, vy = policy_action_to_velocity((0.0, 0.0))
-    assert math.isclose(vx, 0.0, abs_tol=1e-6)
+    assert math.isclose(vx, DRONE_SPEED * MIN_POLICY_THROTTLE, rel_tol=1e-6)
     assert math.isclose(vy, 0.0, abs_tol=1e-6)
 
 

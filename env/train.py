@@ -97,6 +97,10 @@ def parse_args() -> argparse.Namespace:
                    help="Save checkpoint every N generations")
     p.add_argument("--eval-episodes", type=int, default=8,
                    help="Fixed-seed evaluation episodes per generation")
+    p.add_argument("--random-action-steps", type=int, default=10_000,
+                   help="Per-agent env steps to collect random moving actions")
+    p.add_argument("--learning-starts", type=int, default=10_000,
+                   help="Per-agent env steps to collect before gradient updates")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -121,6 +125,20 @@ def build_vec_env(
     )
     env.reset()
     return env
+
+
+def sample_vectorized_random_actions(
+    agent_ids: list[str],
+    action_space_by_agent: dict[str, object],
+    num_envs: int,
+) -> dict[str, np.ndarray]:
+    """Sample one batched random action per agent for AgileRL vector envs."""
+    return {
+        agent_id: np.stack(
+            [action_space_by_agent[agent_id].sample() for _ in range(num_envs)]
+        ).astype(np.float32)
+        for agent_id in agent_ids
+    }
 
 
 def evaluate_policy(
@@ -248,7 +266,12 @@ def _eval_metrics_better(
         if current[key] < best[key]:
             return False
 
-    return current["visible_alignment_mean"] > best["visible_alignment_mean"]
+    if current["visible_alignment_mean"] > best["visible_alignment_mean"]:
+        return True
+    if current["visible_alignment_mean"] < best["visible_alignment_mean"]:
+        return False
+
+    return current["action_speed_mean"] > best["action_speed_mean"]
 
 
 def main() -> None:
@@ -270,8 +293,10 @@ def main() -> None:
     # ── environment ───────────────────────────────────────────────────────
     env = build_vec_env(args.num_envs, args.action_repeat, stage_env_kwargs)
 
-    observation_spaces = [env.single_observation_space(agent) for agent in env.agents]
-    action_spaces = [env.single_action_space(agent) for agent in env.agents]
+    agent_ids = list(env.agents)
+    observation_spaces = [env.single_observation_space(agent) for agent in agent_ids]
+    action_spaces = [env.single_action_space(agent) for agent in agent_ids]
+    action_space_by_agent = dict(zip(agent_ids, action_spaces))
 
     # ── hyperparameters ───────────────────────────────────────────────────
     NET_CONFIG = {
@@ -334,7 +359,7 @@ def main() -> None:
 
     # ── evolutionary HPO ──────────────────────────────────────────────────
     tournament = TournamentSelection(
-        tournament_size=2,
+        tournament_size=min(2, INIT_HP["POPULATION_SIZE"]),
         elitism=True,
         population_size=INIT_HP["POPULATION_SIZE"],
         eval_loop=1,
@@ -383,7 +408,15 @@ def main() -> None:
             steps = 0
 
             for idx_step in range(args.evo_steps // args.num_envs):
-                cont_actions, _ = agent.get_action(state, infos=info)
+                agent_total_steps = agent.steps[-1] + steps
+                if agent_total_steps < args.random_action_steps:
+                    cont_actions = sample_vectorized_random_actions(
+                        agent.agent_ids,
+                        action_space_by_agent,
+                        args.num_envs,
+                    )
+                else:
+                    cont_actions, _ = agent.get_action(state, infos=info)
                 action = cont_actions
 
                 next_state, reward, termination, truncation, info = env.step(action)
@@ -409,18 +442,19 @@ def main() -> None:
                 )
 
                 # ── learning ──────────────────────────────────────────
-                if agent.learn_step > args.num_envs:
-                    learn_step = agent.learn_step // args.num_envs
-                    if (
-                        idx_step % learn_step == 0
-                        and len(memory) >= agent.batch_size
-                    ):
-                        experiences = memory.sample(agent.batch_size)
-                        agent.learn(experiences)
-                elif len(memory) >= agent.batch_size:
-                    for _ in range(args.num_envs // agent.learn_step):
-                        experiences = memory.sample(agent.batch_size)
-                        agent.learn(experiences)
+                if agent.steps[-1] + steps >= args.learning_starts:
+                    if agent.learn_step > args.num_envs:
+                        learn_step = agent.learn_step // args.num_envs
+                        if (
+                            idx_step % learn_step == 0
+                            and len(memory) >= agent.batch_size
+                        ):
+                            experiences = memory.sample(agent.batch_size)
+                            agent.learn(experiences)
+                    elif len(memory) >= agent.batch_size:
+                        for _ in range(args.num_envs // agent.learn_step):
+                            experiences = memory.sample(agent.batch_size)
+                            agent.learn(experiences)
 
                 state = next_state
 

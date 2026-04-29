@@ -72,7 +72,7 @@ REWARD_CONTAINMENT_STEP = 0.0
 REWARD_ESCAPE = 0.0                # prey escapes from CONTAINED → FREE
 PENALTY_OBSTACLE_COLLISION = -0.25
 PENALTY_PREDATOR_COLLISION = -0.10
-PENALTY_IDLE = 0.0                 # per step when speed < IDLE_SPEED_THRESHOLD
+PENALTY_IDLE = -0.002              # per step when speed < IDLE_SPEED_THRESHOLD
 IDLE_SPEED_THRESHOLD = 1.0
 
 DIST_SHAPING_CLIP = 0.005          # per-step distance-shaping clipped to [-clip, +clip]
