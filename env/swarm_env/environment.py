@@ -57,10 +57,14 @@ from swarm_env.config import (
     REWARD_THREATENED,
     REWARD_COMBINED_PROGRESS,
     REWARD_HOLD_PROGRESS,
+    REWARD_VISIBLE_ALIGNMENT,
+    PENALTY_VISIBLE_MISALIGNMENT,
+    REWARD_CAPTURE_RANGE_STEP,
     PENALTY_OBSTACLE_COLLISION,
     PENALTY_PREDATOR_COLLISION,
     PENALTY_IDLE,
     IDLE_SPEED_THRESHOLD,
+    DIST_SHAPING_SCALE,
     DIST_SHAPING_CLIP,
     R_CAPTURE_RANGE,
     R_DANGER,
@@ -467,8 +471,32 @@ class Environment:
             delta = prev_distance - distance  # positive = this predator got closer
             rewards[idx] += max(
                 -DIST_SHAPING_CLIP,
-                min(DIST_SHAPING_CLIP, delta / WORLD_SCALE),
+                min(DIST_SHAPING_CLIP, (delta / WORLD_SCALE) * DIST_SHAPING_SCALE),
             )
+
+        if self.prey is not None and self._team_sees_prey():
+            prey_pos = self.prey.position
+            for idx, drone in enumerate(self.drones):
+                distance = current_distances[idx]
+                if distance <= R_CAPTURE_RANGE:
+                    rewards[idx] += REWARD_CAPTURE_RANGE_STEP
+
+                speed = drone.velocity.length()
+                if speed <= 1e-8 or distance <= 1e-8:
+                    continue
+
+                to_prey = pygame.math.Vector2(
+                    prey_pos.x - drone.position.x,
+                    prey_pos.y - drone.position.y,
+                )
+                alignment = drone.velocity.dot(to_prey) / (speed * distance)
+                speed_frac = min(1.0, speed / DRONE_SPEED)
+                if alignment >= 0:
+                    rewards[idx] += REWARD_VISIBLE_ALIGNMENT * alignment * speed_frac
+                else:
+                    rewards[idx] += (
+                        PENALTY_VISIBLE_MISALIGNMENT * (-alignment) * speed_frac
+                    )
         self._prev_predator_distances = current_distances
         self._prev_capture_combined = current_combined
         self._prev_hold_counter = capture.hold_counter

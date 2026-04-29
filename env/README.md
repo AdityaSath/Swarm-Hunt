@@ -253,7 +253,7 @@ Typical setup:
 
 Because this env follows PettingZoo Parallel API, it plugs into PettingZoo-compatible AgileRL pipelines directly.
 
-Training script: `train.py` (check `--help` for curriculum, vectorized envs, fixed-seed evaluation, random-action warmup, delayed learning, and other flags). The default curriculum now eases multiple task dimensions, not just prey speed: early stages can disable obstacles, make prey globally visible, and shorten the capture hold. For visual evaluation of a saved policy, use `demo.py` and keep `--action-repeat` consistent with training.
+Training script: `train.py` (check `--help` for curriculum, vectorized envs, fixed-seed evaluation, random-action warmup, delayed learning, and other flags). The default curriculum now starts with stationary visible prey, then gradually adds prey speed, normal visibility, obstacles, and the full capture hold. For visual evaluation of a saved policy, use `demo.py` and keep `--action-repeat` consistent with training. To inspect checkpoint behavior over time, run `python analyze_matd3_checkpoints.py --episodes 2` from `env/`.
 
 ## Tests
 

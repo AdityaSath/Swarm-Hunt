@@ -35,8 +35,28 @@ from swarm_env.policy_actions import action_to_velocity
 
 CURRICULUM_STAGES = [
     {
-        "label": "Stage 1 (visible, no obstacles, prey 0.35x, hold 1.0s)",
-        "advance_rate": 0.35,
+        "label": "Stage 1 (stationary visible prey, no obstacles, hold 0.25s)",
+        "advance_rate": 0.60,
+        "env_kwargs": {
+            "prey_speed_factor": 0.0,
+            "enable_obstacles": False,
+            "always_visible": True,
+            "capture_hold_seconds": 0.25,
+        },
+    },
+    {
+        "label": "Stage 2 (visible, no obstacles, prey 0.20x, hold 0.5s)",
+        "advance_rate": 0.50,
+        "env_kwargs": {
+            "prey_speed_factor": 0.2,
+            "enable_obstacles": False,
+            "always_visible": True,
+            "capture_hold_seconds": 0.5,
+        },
+    },
+    {
+        "label": "Stage 3 (visible, no obstacles, prey 0.35x, hold 1.0s)",
+        "advance_rate": 0.40,
         "env_kwargs": {
             "prey_speed_factor": 0.35,
             "enable_obstacles": False,
@@ -45,7 +65,7 @@ CURRICULUM_STAGES = [
         },
     },
     {
-        "label": "Stage 2 (no obstacles, prey 0.5x, hold 1.5s)",
+        "label": "Stage 4 (no obstacles, prey 0.5x, hold 1.5s)",
         "advance_rate": 0.30,
         "env_kwargs": {
             "prey_speed_factor": 0.5,
@@ -55,7 +75,7 @@ CURRICULUM_STAGES = [
         },
     },
     {
-        "label": "Stage 3 (obstacles on, prey 0.75x, hold 2.0s)",
+        "label": "Stage 5 (obstacles on, prey 0.75x, hold 2.0s)",
         "advance_rate": 0.25,
         "env_kwargs": {
             "prey_speed_factor": 0.75,
@@ -65,7 +85,7 @@ CURRICULUM_STAGES = [
         },
     },
     {
-        "label": "Stage 4 (full difficulty)",
+        "label": "Stage 6 (full difficulty)",
         "advance_rate": 0.20,
         "env_kwargs": {
             "prey_speed_factor": 1.0,
@@ -76,7 +96,7 @@ CURRICULUM_STAGES = [
     },
 ]
 CURRICULUM_ADVANCE_RATE = 0.30
-CURRICULUM_WINDOW = 100
+CURRICULUM_WINDOW = 50
 
 
 def parse_args() -> argparse.Namespace:
@@ -309,17 +329,17 @@ def main() -> None:
         "POPULATION_SIZE": args.pop_size,
         "ALGO": "MATD3",
         "CHANNELS_LAST": False,
-        "BATCH_SIZE": 256,
+        "BATCH_SIZE": 128,
         "O_U_NOISE": True,
-        "EXPL_NOISE": 0.15,
+        "EXPL_NOISE": 0.25,
         "MEAN_NOISE": 0.0,
         "THETA": 0.15,
-        "DT": 0.01,
+        "DT": 1.0,
         "LR_ACTOR": 3e-4,
         "LR_CRITIC": 3e-4,
         "GAMMA": 0.99,
         "MEMORY_SIZE": 500_000,
-        "LEARN_STEP": 100,
+        "LEARN_STEP": 50,
         "TAU": 0.005,
         "POLICY_FREQ": 2,
         "N_AGENTS": env.num_agents,
