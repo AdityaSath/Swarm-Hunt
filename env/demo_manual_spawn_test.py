@@ -119,9 +119,16 @@ def apply_test_layout(env: Environment) -> None:
     env._episode_state = EpisodeState.IN_PURSUIT
     env._step_count = 0
     env._prev_indiv_dists = env._per_drone_prey_dists()
+    env._prev_mean_prey_dist = (
+        sum(env._prev_indiv_dists) / len(env._prev_indiv_dists)
+        if env._prev_indiv_dists
+        else 0.0
+    )
     env._prev_tactical = PreyTacticalState.FREE
     env._obs_collisions = [False] * len(env.drones)
     env._pred_collisions = [False] * len(env.drones)
+    env._wall_contacts = [False] * len(env.drones)
+    env._edge_stuck_counts = [0] * len(env.drones)
 
 
 def _wasd_velocity(keys) -> tuple[float, float]:

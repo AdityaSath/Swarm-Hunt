@@ -40,6 +40,15 @@ CURRICULUM_STAGES = [
 CURRICULUM_ADVANCE_RATE = 0.20
 CURRICULUM_WINDOW = 100
 
+# Override the legacy warmup with a much tighter curriculum so the prey is
+# never trained at "frozen" speeds.
+CURRICULUM_STAGES = [
+    {"prey_speed_factor": 0.70, "label": "Stage 0 (prey 0.70x)"},
+    {"prey_speed_factor": 0.85, "label": "Stage 1 (prey 0.85x)"},
+    {"prey_speed_factor": 1.0, "label": "Stage 2 (prey 1.0x - full)"},
+]
+CURRICULUM_ADVANCE_RATE = 0.25
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train MATD3 on pursuit_v1")
@@ -87,6 +96,40 @@ def build_vec_env(
     return env
 
 
+def synchronize_module_dict(module_dict) -> None:
+    """Average same-architecture per-agent networks so the swarm behaves homogeneously."""
+    agent_ids = list(module_dict.keys())
+    if len(agent_ids) <= 1:
+        return
+
+    state_dicts = [module_dict[agent_id].state_dict() for agent_id in agent_ids]
+    averaged_state = {}
+    for name, ref in state_dicts[0].items():
+        if torch.is_tensor(ref) and ref.is_floating_point():
+            stacked = torch.stack(
+                [state[name].detach().to(dtype=torch.float32) for state in state_dicts],
+                dim=0,
+            )
+            averaged_state[name] = stacked.mean(dim=0).to(
+                device=ref.device,
+                dtype=ref.dtype,
+            )
+        else:
+            averaged_state[name] = ref.clone() if torch.is_tensor(ref) else ref
+
+    for agent_id in agent_ids:
+        module_dict[agent_id].load_state_dict(averaged_state)
+
+
+def enforce_homogeneous_swarm(agent) -> None:
+    synchronize_module_dict(agent.actors)
+    synchronize_module_dict(agent.actor_targets)
+    synchronize_module_dict(agent.critics_1)
+    synchronize_module_dict(agent.critics_2)
+    synchronize_module_dict(agent.critic_targets_1)
+    synchronize_module_dict(agent.critic_targets_2)
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(
@@ -125,8 +168,8 @@ def main() -> None:
         "ALGO": "MATD3",
         "CHANNELS_LAST": False,
         "BATCH_SIZE": 256,
-        "O_U_NOISE": True,
-        "EXPL_NOISE": 0.15,
+        "O_U_NOISE": False,
+        "EXPL_NOISE": 0.10,
         "MEAN_NOISE": 0.0,
         "THETA": 0.15,
         "DT": 0.01,
@@ -162,6 +205,8 @@ def main() -> None:
         num_envs=args.num_envs,
         device=device,
     )
+    for agent in pop:
+        enforce_homogeneous_swarm(agent)
 
     # ── replay buffer ─────────────────────────────────────────────────────
     field_names = ["state", "action", "reward", "next_state", "done"]
@@ -254,10 +299,12 @@ def main() -> None:
                     ):
                         experiences = memory.sample(agent.batch_size)
                         agent.learn(experiences)
+                        enforce_homogeneous_swarm(agent)
                 elif len(memory) >= agent.batch_size:
                     for _ in range(args.num_envs // agent.learn_step):
                         experiences = memory.sample(agent.batch_size)
                         agent.learn(experiences)
+                        enforce_homogeneous_swarm(agent)
 
                 state = next_state
 
@@ -354,6 +401,9 @@ def main() -> None:
             pop = mutations.mutation(pop)
         else:
             elite = pop[0]
+
+        for agent in pop:
+            enforce_homogeneous_swarm(agent)
 
         for agent in pop:
             agent.steps.append(agent.steps[-1])
