@@ -1,0 +1,27 @@
+# Core ML stack
+torch>=2.2.0
+torchvision
+torchaudio
+
+# TorchRL (for Track B)
+torchrl
+
+# VMAS (vectorized simulator)
+vmas
+
+# Multi-agent env + wrappers (Track A)
+pettingzoo
+supersuit>=3.9,<4
+mpe2
+
+# RL library (Track A)
+agilerl
+
+# Gym interface
+gymnasium
+
+# Utilities
+numpy
+tqdm
+matplotlib
+tensorboard
