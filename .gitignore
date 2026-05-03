@@ -23,3 +23,5 @@ Thumbs.db
 # Virtual environments
 .venv/
 venv/
+
+env/swarm_env/__pycache__
