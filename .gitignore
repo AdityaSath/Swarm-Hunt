@@ -24,4 +24,4 @@ Thumbs.db
 .venv/
 venv/
 
-env/swarm_env/__pycache__
+env/swarm_env/__pycache__/
