@@ -1,22 +1,29 @@
-"""Predator drone: desired-velocity dynamics, local perception."""
-
-import math
+"""Predator drone with acceleration-limited desired-velocity dynamics."""
 
 import pygame
 
-from swarm_env.config import DRONE_RADIUS, DRONE_SPEED, R_SENSE, DT
+from swarm_env.config import (
+    DRONE_RADIUS,
+    DRONE_SPEED,
+    DRONE_MAX_ACCELERATION,
+    R_SENSE,
+    DT,
+)
 
 
 class Drone:
     """
     Predator agent with desired-velocity control.
 
-    Each step the environment provides (vx_desired, vy_desired).  The drone
-    clips the magnitude to DRONE_SPEED and integrates position by DT.
+    Each step the environment provides (vx_desired, vy_desired). The command
+    is speed-clipped, then the actual velocity approaches it at no more than
+    DRONE_MAX_ACCELERATION. This avoids instantaneous direction reversals
+    while preserving direct velocity control for the policy.
 
     Attributes:
         position: world (x, y)
-        velocity: world (vx, vy) after clipping
+        velocity: actual world velocity (vx, vy)
+        desired_velocity: clipped policy command (vx, vy)
         collision_radius: radius for physics
         perception_range: R_SENSE from config
     """
@@ -31,7 +38,11 @@ class Drone:
         perception_range: float = R_SENSE,
     ):
         self.position = pygame.math.Vector2(x, y)
-        self.velocity = pygame.math.Vector2(vx, vy)
+        initial_velocity = pygame.math.Vector2(vx, vy)
+        if initial_velocity.length_squared() > DRONE_SPEED * DRONE_SPEED:
+            initial_velocity.scale_to_length(DRONE_SPEED)
+        self.velocity = initial_velocity
+        self.desired_velocity = initial_velocity.copy()
         self.collision_radius = radius
         self.perception_range = perception_range
 
@@ -40,42 +51,34 @@ class Drone:
         return self.collision_radius
 
     def set_desired_velocity(self, vx: float, vy: float) -> None:
-        """Set velocity from desired (vx, vy), clipping magnitude to DRONE_SPEED."""
+        """Store a desired velocity, clipped to the configured top speed."""
         v = pygame.math.Vector2(vx, vy)
         if v.length_squared() > DRONE_SPEED * DRONE_SPEED:
             v.scale_to_length(DRONE_SPEED)
-        self.velocity = v
+        self.desired_velocity = v
 
     def integrate(self, dt: float = DT) -> None:
-        """Advance position by one timestep. Caller handles collision."""
+        """Approach the command at bounded acceleration, then advance position."""
+        velocity_delta = self.desired_velocity - self.velocity
+        max_delta = max(0.0, DRONE_MAX_ACCELERATION * dt)
+        if velocity_delta.length_squared() > max_delta * max_delta:
+            velocity_delta.scale_to_length(max_delta)
+        self.velocity += velocity_delta
+
+        # Numerical guard: acceleration limiting should not exceed this, but
+        # collision response and future dynamics should never violate max speed.
+        if self.velocity.length_squared() > DRONE_SPEED * DRONE_SPEED:
+            self.velocity.scale_to_length(DRONE_SPEED)
         self.position += self.velocity * dt
 
     # ----- rendering helpers -----
-
-    @property
-    def heading(self) -> float:
-        """Visual heading from current velocity (0 when stationary)."""
-        if self.velocity.length_squared() > 0:
-            return math.atan2(self.velocity.y, self.velocity.x)
-        return 0.0
-
-    def get_vertices(self) -> list[tuple[float, float]]:
-        cx, cy = self.position.x, self.position.y
-        r = self.collision_radius
-        h = self.heading
-        cos_h = math.cos(h)
-        sin_h = math.sin(h)
-        tip = (cx + r * cos_h, cy + r * sin_h)
-        back_left = (cx - 0.7 * r * cos_h + 0.4 * r * sin_h,
-                     cy - 0.7 * r * sin_h - 0.4 * r * cos_h)
-        back_right = (cx - 0.7 * r * cos_h - 0.4 * r * sin_h,
-                      cy - 0.7 * r * sin_h + 0.4 * r * cos_h)
-        return [tip, back_left, back_right]
 
     def get_collision_circle(self) -> tuple[tuple[float, float], float]:
         return ((self.position.x, self.position.y), self.collision_radius)
 
     def draw(self, screen: pygame.Surface, color: tuple = (60, 140, 200)):
-        points = self.get_vertices()
-        pygame.draw.polygon(screen, color, points)
-        pygame.draw.polygon(screen, (100, 180, 220), points, 1)
+        cx = int(round(self.position.x))
+        cy = int(round(self.position.y))
+        r = max(1, int(round(self.collision_radius)))
+        pygame.draw.circle(screen, color, (cx, cy), r)
+        pygame.draw.circle(screen, (100, 180, 220), (cx, cy), r, 1)

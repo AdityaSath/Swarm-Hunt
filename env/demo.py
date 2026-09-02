@@ -5,7 +5,8 @@ Usage:
     python demo.py                                          # most recent .pt
     python demo.py --checkpoint models/MATD3/some_file.pt
     python demo.py --prey-speed-factor 0.5                  # easier prey
-    python demo.py --action-repeat 4                        # match training (default)
+    python demo.py --action-repeat 2                        # match training (default)
+    python demo.py --prey-bounce-scale 0.5                   # override bounce speed scale
 """
 
 from __future__ import annotations
@@ -17,44 +18,49 @@ import os
 import numpy as np
 import pygame
 import torch
-from agilerl.algorithms.matd3 import MATD3
 
-from swarm_env.config import ARENA_WIDTH, ARENA_HEIGHT, FPS, DT, DRONE_COUNT, DRONE_SPEED
-from swarm_env.environment import Environment, OBS_SIZE
+from swarm_env.config import (
+    ARENA_WIDTH,
+    ARENA_HEIGHT,
+    FPS,
+    DT,
+    DRONE_COUNT,
+    PREY_SPEED,
+    PREY_BOUNCE_SPEED_SCALE,
+)
+from swarm_env.environment import Environment
 from swarm_env.capture import PreyTacticalState
-import gymnasium
+from swarm_ml import AGENT_IDS, build_matd3, load_bc_actors
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Demo trained MATD3 agents")
-    p.add_argument("--checkpoint", type=str, default=None,
-                   help="Path to .pt file (default: most recent in models/MATD3/)")
+    policy = p.add_mutually_exclusive_group()
+    policy.add_argument("--checkpoint", type=str, default=None,
+                        help="MATD3 .pt (default: most recent in models/MATD3/)")
+    policy.add_argument("--bc-checkpoint", type=str, default=None,
+                        help="Behavior-cloned actor from pretrain_bc.py")
     p.add_argument("--prey-speed-factor", type=float, default=1.0)
-    p.add_argument("--action-repeat", type=int, default=4,
+    p.add_argument("--action-repeat", type=int, default=2,
                    help="Physics steps per policy decision (match train.py)")
     p.add_argument("--episodes", type=int, default=0,
                    help="Auto-reset after N episodes (0 = infinite, manual R to reset)")
+    p.add_argument(
+        "--prey-bounce-scale",
+        type=float,
+        default=None,
+        help="Bounce speed = PREY_SPEED * prey_speed_factor * this "
+        f"(default: {PREY_BOUNCE_SPEED_SCALE} from config). "
+        "Try 0.4–0.8 if motion looks frozen.",
+    )
     return p.parse_args()
 
 
-def build_agent(checkpoint: str, device: torch.device) -> MATD3:
-    agent_ids = [f"predator_{i}" for i in range(DRONE_COUNT)]
-    observation_spaces = [
-        gymnasium.spaces.Box(low=-np.inf, high=np.inf, shape=(OBS_SIZE,), dtype=np.float32)
-        for _ in agent_ids
-    ]
-    action_spaces = [
-        gymnasium.spaces.Box(low=-DRONE_SPEED, high=DRONE_SPEED, shape=(2,), dtype=np.float32)
-        for _ in agent_ids
-    ]
-
-    agent = MATD3(
-        observation_spaces=observation_spaces,
-        action_spaces=action_spaces,
-        agent_ids=agent_ids,
-        device=device,
-    )
+def build_agent(checkpoint: str, device: torch.device):
+    agent = build_matd3(device=device)
     agent.load_checkpoint(checkpoint)
+    # Eval mode: training=True makes get_action() add exploration noise (TD3/MATD3).
+    agent.set_training_mode(False)
     return agent
 
 
@@ -63,25 +69,45 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     checkpoint = args.checkpoint
-    if checkpoint is None:
+    if checkpoint is None and args.bc_checkpoint is None:
         pts = sorted(glob.glob("./models/MATD3/*.pt"), key=os.path.getmtime)
         if not pts:
             print("No checkpoint found in models/MATD3/. Train first.")
             return
         checkpoint = pts[-1]
 
-    agent = build_agent(checkpoint, device)
-    print(f"Loaded checkpoint: {checkpoint}  |  Device: {device}")
+    if args.bc_checkpoint:
+        agent = build_matd3(device=device)
+        load_bc_actors(agent, args.bc_checkpoint)
+        loaded_path = args.bc_checkpoint
+        policy_label = "behavior-cloned actor"
+    else:
+        assert checkpoint is not None
+        agent = build_agent(checkpoint, device)
+        loaded_path = checkpoint
+        policy_label = "MATD3 checkpoint"
+    agent.set_training_mode(False)
+    print(f"Loaded {policy_label}: {loaded_path}  |  Device: {device}")
+
+    _bs = args.prey_bounce_scale if args.prey_bounce_scale is not None else PREY_BOUNCE_SPEED_SCALE
+    v = PREY_SPEED * args.prey_speed_factor * _bs
+    print(
+        f"Prey: wall-bouncing ball  |  speed ~ {v:.1f} px/s  (scale {_bs})"
+    )
 
     pygame.init()
     screen = pygame.display.set_mode((ARENA_WIDTH, ARENA_HEIGHT))
-    pygame.display.set_caption("Pursuit V1 — Trained Agent Demo")
+    pygame.display.set_caption("Pursuit V1 - Trained Agent Demo")
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 36)
     small_font = pygame.font.Font(None, 24)
 
-    env = Environment(dt=DT, prey_speed_factor=args.prey_speed_factor)
-    agent_ids = [f"predator_{i}" for i in range(DRONE_COUNT)]
+    env = Environment(
+        dt=DT,
+        prey_speed_factor=args.prey_speed_factor,
+        prey_bounce_speed_scale=args.prey_bounce_scale,
+    )
+    agent_ids = AGENT_IDS
     idx_to_agent = {i: a for i, a in enumerate(agent_ids)}
 
     episode = 0
@@ -149,7 +175,8 @@ def main() -> None:
         }
         state_text = small_font.render(
             f"Tactical: {tactical.name}  |  Step: {env._step_count}  |  "
-            f"Prey: {args.prey_speed_factor:.1f}x  |  action_repeat: {args.action_repeat}",
+            f"Prey: {args.prey_speed_factor:.1f}x  |  "
+            f"action_repeat: {args.action_repeat}",
             True, state_colors.get(tactical, (200, 200, 200)),
         )
         screen.blit(state_text, (10, ARENA_HEIGHT - 30))

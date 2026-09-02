@@ -6,10 +6,10 @@ The thin PettingZoo wrapper lives in ``parallel_env.py``.
 
 Step order:
     1. Apply predator desired velocities
-    2. Scripted prey policy
-    3. Physics (walls, obstacles, collisions)
-    4. Capture geometry + tactical FSM
-    5. Rewards
+    2. Physics (walls, obstacles, collisions; prey bounces on arena edges)
+    3. Capture geometry + tactical FSM
+    4. Rewards
+    5. Episode termination / truncation
     6. Observations
 """
 
@@ -43,6 +43,7 @@ from swarm_env.config import (
     DRONE_SPEED,
     PREY_RADIUS,
     PREY_SPEED,
+    PREY_BOUNCE_SPEED_SCALE,
     OBSTACLE_POSITIONS,
     DT,
     MAX_STEPS,
@@ -57,26 +58,63 @@ from swarm_env.config import (
     PENALTY_PREDATOR_COLLISION,
     PENALTY_IDLE,
     IDLE_SPEED_THRESHOLD,
-    DIST_SHAPING_CLIP,
+    TEAM_MEAN_PROGRESS_CLIP,
+    TEAM_MEAN_PROGRESS_WEIGHT,
+    TEAM_CAPTURE_RANGE_WEIGHT,
+    TEAM_HOLD_PROGRESS_WEIGHT,
+    FORMATION_TARGET_RADIUS,
+    FORMATION_PROGRESS_CLIP,
+    FORMATION_PROGRESS_WEIGHT,
+    FORMATION_PROXIMITY_RADIUS,
+    FORMATION_PROXIMITY_REWARD,
+    ANGULAR_COVERAGE_REWARD,
+    REWARD_VELOCITY_TOWARD_PREY,
+    VELOCITY_TOWARD_MIN_DIST,
+    CHASE_BOOTSTRAP_STEPS,
+    CHASE_BOOTSTRAP_MULT,
+    REWARD_IN_CAPTURE_RING_PER_STEP,
+    REWARD_SLOW_IN_RING,
+    BOUNDARY_MARGIN_PENALTY,
+    PENALTY_BOUNDARY_PROXIMITY,
+    EDGE_STRAGGLER_BAND_PX,
+    PENALTY_EDGE_STRAGGLER,
+    STRAGGLER_DIST_SCALE,
+    STUCK_EDGE_MARGIN,
+    STUCK_SPEED_THRESHOLD,
+    STUCK_STEPS,
+    PENALTY_STUCK,
+    WALL_TANGENT_DAMPING,
+    OBSTACLE_TANGENT_DAMPING,
+    PREDATOR_TANGENT_DAMPING,
     R_CAPTURE_RANGE,
     R_DANGER,
-    COMBO_CAPTURE_NEED,
     CONTRIBUTOR_BONUS,
     CONTRIBUTOR_BONUS_ENABLED,
+    CAPTURE_HOLD_STEPS,
+    COMBO_CAPTURE_NEED,
 )
 
 # Per-predator observation size:
 #   self: pos(2) + vel(2) = 4
+#   role: sin(angle) + cos(angle) = 2
 #   prey: visible(1) + rel_pos(2) + rel_vel(2) + dist(1) = 6
 #   K teammates: each valid(1) + rel_pos(2) + rel_vel(2) + dist(1) = 6  → K*6
 #   M obstacles: each valid(1) + rel_pos(2) + char_radius(1) + dist(1) = 5  → M*5
 #   borders: left, right, top, bottom = 4
 OBS_SELF = 4
+OBS_ROLE = 2
 OBS_PREY = 6
 OBS_TEAMMATE_SLOT = 6
 OBS_OBSTACLE_SLOT = 5
 OBS_BORDER = 4
-OBS_SIZE = OBS_SELF + OBS_PREY + K_TEAMMATES * OBS_TEAMMATE_SLOT + M_OBSTACLES * OBS_OBSTACLE_SLOT + OBS_BORDER
+OBS_SIZE = (
+    OBS_SELF
+    + OBS_ROLE
+    + OBS_PREY
+    + K_TEAMMATES * OBS_TEAMMATE_SLOT
+    + M_OBSTACLES * OBS_OBSTACLE_SLOT
+    + OBS_BORDER
+)
 
 
 # ── collision helpers (pure functions) ────────────────────────────────────
@@ -91,8 +129,8 @@ def _circle_rect_overlap(cx: float, cy: float, r: float, rect: pygame.Rect) -> b
 
 def _push_circle_out_of_rect(
     center: pygame.math.Vector2, radius: float, rect: pygame.Rect
-) -> tuple[pygame.math.Vector2, bool]:
-    """Push circle out of rect. Returns (new_pos, collided)."""
+) -> tuple[pygame.math.Vector2, bool, pygame.math.Vector2 | None]:
+    """Push circle out of rect. Returns (new_pos, collided, outward_normal)."""
     cx, cy = center.x, center.y
     closest_x = max(rect.left, min(rect.right, cx))
     closest_y = max(rect.top, min(rect.bottom, cy))
@@ -101,7 +139,7 @@ def _push_circle_out_of_rect(
     dist_sq = dx * dx + dy * dy
 
     if dist_sq >= radius * radius:
-        return center, False
+        return center, False, None
 
     if dist_sq == 0:
         to_left = cx - rect.left
@@ -110,36 +148,45 @@ def _push_circle_out_of_rect(
         to_bottom = rect.bottom - cy
         min_dist = min(to_left, to_right, to_top, to_bottom)
         if min_dist == to_left:
-            return pygame.math.Vector2(rect.left - radius, cy), True
+            return pygame.math.Vector2(rect.left - radius, cy), True, pygame.math.Vector2(-1, 0)
         if min_dist == to_right:
-            return pygame.math.Vector2(rect.right + radius, cy), True
+            return pygame.math.Vector2(rect.right + radius, cy), True, pygame.math.Vector2(1, 0)
         if min_dist == to_top:
-            return pygame.math.Vector2(cx, rect.top - radius), True
-        return pygame.math.Vector2(cx, rect.bottom + radius), True
+            return pygame.math.Vector2(cx, rect.top - radius), True, pygame.math.Vector2(0, -1)
+        return pygame.math.Vector2(cx, rect.bottom + radius), True, pygame.math.Vector2(0, 1)
 
     dist = math.sqrt(dist_sq)
     overlap = radius - dist
     nx = dx / dist
     ny = dy / dist
-    return center + pygame.math.Vector2(nx * overlap, ny * overlap), True
+    normal = pygame.math.Vector2(nx, ny)
+    return center + pygame.math.Vector2(nx * overlap, ny * overlap), True, normal
 
 
 def _push_circles_apart(
     pos1: pygame.math.Vector2, r1: float,
     pos2: pygame.math.Vector2, r2: float,
-) -> tuple[pygame.math.Vector2, pygame.math.Vector2, bool]:
-    """Push two circles apart. Returns (new_p1, new_p2, collided)."""
+) -> tuple[
+    pygame.math.Vector2,
+    pygame.math.Vector2,
+    bool,
+    pygame.math.Vector2 | None,
+    pygame.math.Vector2 | None,
+]:
+    """Push two circles apart. Returns (new_p1, new_p2, collided, n1, n2)."""
     dx = pos2.x - pos1.x
     dy = pos2.y - pos1.y
     dist_sq = dx * dx + dy * dy
     combined = r1 + r2
     if dist_sq >= combined * combined:
-        return pos1, pos2, False
+        return pos1, pos2, False, None, None
     if dist_sq == 0:
         return (
             pos1 + pygame.math.Vector2(r1, 0),
             pos2 + pygame.math.Vector2(-r2, 0),
             True,
+            pygame.math.Vector2(1, 0),
+            pygame.math.Vector2(-1, 0),
         )
     dist = math.sqrt(dist_sq)
     overlap = combined - dist
@@ -150,7 +197,28 @@ def _push_circles_apart(
         pos1 - pygame.math.Vector2(nx * half, ny * half),
         pos2 + pygame.math.Vector2(nx * half, ny * half),
         True,
+        pygame.math.Vector2(-nx, -ny),
+        pygame.math.Vector2(nx, ny),
     )
+
+
+def _slide_velocity(
+    velocity: pygame.math.Vector2,
+    normal: pygame.math.Vector2 | None,
+    tangent_damping: float = 1.0,
+) -> pygame.math.Vector2:
+    """Remove inward motion while preserving tangential slide along the contact surface."""
+    if normal is None:
+        return velocity
+    n = pygame.math.Vector2(normal)
+    if n.length_squared() == 0:
+        return velocity
+    n = n.normalize()
+    inward = velocity.dot(n)
+    if inward >= 0.0:
+        return velocity
+    tangential = velocity - n * inward
+    return tangential * tangent_damping
 
 
 # ── environment ───────────────────────────────────────────────────────────
@@ -171,29 +239,44 @@ class Environment:
         dt: float = DT,
         seed: int | None = None,
         prey_speed_factor: float = 1.0,
+        prey_bounce_speed_scale: float | None = None,
+        obstacles_enabled: bool = True,
+        capture_hold_steps: int = CAPTURE_HOLD_STEPS,
+        combo_capture_need: int = COMBO_CAPTURE_NEED,
     ):
         self.dt = dt
         self._width = width
         self._height = height
         self._drone_count = drone_count
         self._prey_speed_factor = max(0.0, prey_speed_factor)
+        self._prey_bounce_speed_scale = prey_bounce_speed_scale
+        self._obstacles_enabled = bool(obstacles_enabled)
+        self._capture_hold_steps = max(1, int(capture_hold_steps))
+        self._combo_capture_need = max(1, int(combo_capture_need))
         self.arena = Arena(width, height)
 
         self.obstacles: list[Obstacle] = []
         self.drones: list[Drone] = []
         self.prey: Prey | None = None
 
-        self._fsm = TacticalFSM()
+        self._fsm = TacticalFSM(
+            capture_hold_steps=self._capture_hold_steps,
+            combo_capture_need=self._combo_capture_need,
+        )
         self._episode_state = EpisodeState.IN_PURSUIT
         self._step_count = 0
 
         # reward bookkeeping
-        self._prev_mean_dist: float = 0.0
+        self._prev_indiv_dists: list[float] = []
+        self._prev_mean_prey_dist = 0.0
+        self._prev_role_errors: list[float] = []
         self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
 
         # per-step collision flags (set during physics, consumed by rewards)
         self._obs_collisions: list[bool] = []
         self._pred_collisions: list[bool] = []
+        self._wall_contacts: list[bool] = []
+        self._edge_stuck_counts: list[int] = []
 
         # demo-mode wandering: persist random velocities across frames
         self._demo_actions: dict[int, tuple[float, float]] = {}
@@ -216,10 +299,18 @@ class Environment:
         self._init_drones()
         self._init_prey()
 
-        self._prev_mean_dist = self._mean_pred_prey_dist()
+        self._prev_indiv_dists = self._per_drone_prey_dists()
+        self._prev_mean_prey_dist = (
+            float(np.mean(np.asarray(self._prev_indiv_dists, dtype=np.float64)))
+            if self._prev_indiv_dists
+            else 0.0
+        )
+        self._prev_role_errors = self._formation_role_errors()
         self._prev_tactical = PreyTacticalState.FREE
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
+        self._wall_contacts = [False] * self._drone_count
+        self._edge_stuck_counts = [0] * self._drone_count
 
         observations = self._compute_observations()
         infos: dict[str, Any] = {"episode_state": self._episode_state, "tactical_state": self._fsm.state}
@@ -243,22 +334,16 @@ class Environment:
         # 1. apply predator desired velocities
         self._apply_actions(actions)
 
-        # 2. scripted prey policy
-        if self.prey is not None:
-            pred_pos = [(d.position.x, d.position.y) for d in self.drones]
-            obs_rects = [o.get_collision_rect() for o in self.obstacles]
-            self.prey.decide(pred_pos, obs_rects, self._width, self._height)
-
-        # 3. physics
+        # 2. physics (prey: integrate + arena bounce in _physics_step)
         self._physics_step()
 
-        # 4. capture / FSM
+        # 3. capture / FSM
         capture, tactical = self._update_capture()
 
-        # 5. rewards
-        rewards = self._compute_rewards(capture.contributor_indices, tactical)
+        # 4. rewards
+        rewards = self._compute_rewards(capture, tactical)
 
-        # 6. episode termination / truncation
+        # 5. episode termination / truncation
         terminations = {i: False for i in range(n)}
         truncations = {i: False for i in range(n)}
 
@@ -271,7 +356,7 @@ class Environment:
             for i in range(n):
                 truncations[i] = True
 
-        # 7. observations
+        # 6. observations
         observations = self._compute_observations()
 
         infos: dict[str, Any] = {
@@ -313,51 +398,80 @@ class Environment:
     def _physics_step(self) -> None:
         self._obs_collisions = [False] * len(self.drones)
         self._pred_collisions = [False] * len(self.drones)
+        self._wall_contacts = [False] * len(self.drones)
 
         # integrate predators
         for drone in self.drones:
             drone.integrate(self.dt)
 
         # predator–wall clamp
-        for drone in self.drones:
+        for idx, drone in enumerate(self.drones):
+            original = drone.position.copy()
             clamped = self.arena.clamp(drone.position, drone.radius)
-            if clamped.x != drone.position.x or clamped.y != drone.position.y:
-                drone.velocity = pygame.math.Vector2(0, 0)
+            if clamped.x != original.x:
+                normal_x = 1.0 if clamped.x > original.x else -1.0
+                drone.velocity = _slide_velocity(
+                    drone.velocity,
+                    pygame.math.Vector2(normal_x, 0.0),
+                    WALL_TANGENT_DAMPING,
+                )
+                self._wall_contacts[idx] = True
+            if clamped.y != original.y:
+                normal_y = 1.0 if clamped.y > original.y else -1.0
+                drone.velocity = _slide_velocity(
+                    drone.velocity,
+                    pygame.math.Vector2(0.0, normal_y),
+                    WALL_TANGENT_DAMPING,
+                )
+                self._wall_contacts[idx] = True
             drone.position = clamped
 
         # predator–obstacle hard collision
         for idx, drone in enumerate(self.drones):
             for obs in self.obstacles:
-                new_pos, hit = _push_circle_out_of_rect(
+                new_pos, hit, normal = _push_circle_out_of_rect(
                     drone.position, drone.radius, obs.get_collision_rect(),
                 )
                 if hit:
                     drone.position = new_pos
-                    drone.velocity = pygame.math.Vector2(0, 0)
+                    drone.velocity = _slide_velocity(
+                        drone.velocity,
+                        normal,
+                        OBSTACLE_TANGENT_DAMPING,
+                    )
                     self._obs_collisions[idx] = True
 
         # predator–predator collision
         for i in range(len(self.drones)):
             for j in range(i + 1, len(self.drones)):
                 d1, d2 = self.drones[i], self.drones[j]
-                p1, p2, hit = _push_circles_apart(
+                p1, p2, hit, n1, n2 = _push_circles_apart(
                     d1.position, d1.radius, d2.position, d2.radius,
                 )
                 if hit:
                     d1.position = p1
                     d2.position = p2
-                    d1.velocity = pygame.math.Vector2(0, 0)
-                    d2.velocity = pygame.math.Vector2(0, 0)
+                    d1.velocity = _slide_velocity(
+                        d1.velocity,
+                        n1,
+                        PREDATOR_TANGENT_DAMPING,
+                    )
+                    d2.velocity = _slide_velocity(
+                        d2.velocity,
+                        n2,
+                        PREDATOR_TANGENT_DAMPING,
+                    )
                     self._pred_collisions[i] = True
                     self._pred_collisions[j] = True
 
-        # prey integration (ignores obstacles, clip to arena only)
+        # prey: bounce on arena edges
         if self.prey is not None:
             self.prey.integrate(self.dt)
-            clamped = self.arena.clamp(self.prey.position, self.prey.radius)
-            if clamped.x != self.prey.position.x or clamped.y != self.prey.position.y:
-                self.prey.velocity = pygame.math.Vector2(0, 0)
+            clamped, vel = self.arena.clamp_and_bounce(
+                self.prey.position, self.prey.velocity, self.prey.radius
+            )
             self.prey.position = clamped
+            self.prey.velocity = vel
 
     # ── capture / FSM ─────────────────────────────────────────────────────
 
@@ -379,56 +493,200 @@ class Environment:
     # ── rewards ───────────────────────────────────────────────────────────
 
     def _compute_rewards(
-        self, contributor_indices: list[int], tactical: PreyTacticalState
+        self, capture: CaptureStatus, tactical: PreyTacticalState
     ) -> dict[int, float]:
         n = len(self.drones)
-        shared = 0.0
+        rewards = {i: 0.0 for i in range(n)}
+        cur_dists = self._per_drone_prey_dists()
+        mean_dist = (
+            float(np.mean(np.asarray(cur_dists, dtype=np.float64)))
+            if cur_dists
+            else 0.0
+        )
+        team_reward = 0.0
 
-        # terminal
         if tactical == PreyTacticalState.CAPTURED:
-            shared += REWARD_CAPTURE
+            team_reward += REWARD_CAPTURE
         elif self._step_count >= MAX_STEPS:
-            shared += REWARD_TIMEOUT
+            team_reward += REWARD_TIMEOUT
 
-        # tactical transitions
-        prev = self._prev_tactical
-        if prev == PreyTacticalState.FREE and tactical == PreyTacticalState.THREATENED:
-            shared += REWARD_THREATENED
+        if (
+            self._prev_tactical == PreyTacticalState.FREE
+            and tactical == PreyTacticalState.THREATENED
+        ):
+            team_reward += REWARD_THREATENED
 
-        # distance shaping (clipped)
-        mean_dist = self._mean_pred_prey_dist()
-        delta = self._prev_mean_dist - mean_dist  # positive = got closer
-        shared += max(-DIST_SHAPING_CLIP, min(DIST_SHAPING_CLIP, delta / WORLD_SCALE))
-        self._prev_mean_dist = mean_dist
+        delta_mean = self._prev_mean_prey_dist - mean_dist
+        delta_norm = max(
+            -TEAM_MEAN_PROGRESS_CLIP,
+            min(TEAM_MEAN_PROGRESS_CLIP, delta_mean / WORLD_SCALE),
+        )
+        team_reward += TEAM_MEAN_PROGRESS_WEIGHT * delta_norm
+        team_reward += TEAM_CAPTURE_RANGE_WEIGHT * (capture.in_range_count / max(1, n))
+        if capture.hold_counter > 0:
+            team_reward += TEAM_HOLD_PROGRESS_WEIGHT * (
+                capture.hold_counter / self._capture_hold_steps
+            )
 
-        # penalties (shared)
+        for i in range(n):
+            rewards[i] = team_reward
+
+        self._prev_indiv_dists = cur_dists
+        self._prev_mean_prey_dist = mean_dist
+
+        role_errors = self._formation_role_errors()
+        for i, error in enumerate(role_errors):
+            previous = (
+                self._prev_role_errors[i]
+                if i < len(self._prev_role_errors)
+                else error
+            )
+            progress = max(
+                -FORMATION_PROGRESS_CLIP,
+                min(FORMATION_PROGRESS_CLIP, (previous - error) / WORLD_SCALE),
+            )
+            rewards[i] += FORMATION_PROGRESS_WEIGHT * progress
+            proximity = max(0.0, 1.0 - error / FORMATION_PROXIMITY_RADIUS)
+            rewards[i] += FORMATION_PROXIMITY_REWARD * proximity
+        self._prev_role_errors = role_errors
+
+        coverage_reward = ANGULAR_COVERAGE_REWARD * self._angular_coverage()
+        for i in range(n):
+            rewards[i] += coverage_reward
+
+        if (
+            PENALTY_EDGE_STRAGGLER > 0.0
+            and EDGE_STRAGGLER_BAND_PX > 0.0
+            and STRAGGLER_DIST_SCALE > 0.0
+            and self.prey is not None
+            and n >= 2
+        ):
+            median_d = float(np.median(np.asarray(cur_dists, dtype=np.float64)))
+            inv_s = 1.0 / STRAGGLER_DIST_SCALE
+            x_min, y_min, x_max, y_max = self.arena.get_bounds()
+            for i, d in enumerate(self.drones):
+                excess = cur_dists[i] - median_d
+                s = 0.0 if excess <= 0.0 else min(1.0, excess * inv_s)
+                px, py = d.position.x, d.position.y
+                edge_dist = min(px - x_min, x_max - px, py - y_min, y_max - py)
+                if edge_dist >= EDGE_STRAGGLER_BAND_PX:
+                    e = 0.0
+                else:
+                    e = 1.0 - (edge_dist / EDGE_STRAGGLER_BAND_PX)
+                    e = max(0.0, min(1.0, e))
+                rewards[i] -= PENALTY_EDGE_STRAGGLER * e * s
+
+        chase_w = (
+            CHASE_BOOTSTRAP_MULT
+            if self._step_count < CHASE_BOOTSTRAP_STEPS
+            else 1.0
+        )
+        x_min, y_min, x_max, y_max = self.arena.get_bounds()
+        if self.prey is not None:
+            prx = self.prey.position.x
+            pry = self.prey.position.y
+            for i, d in enumerate(self.drones):
+                dx = prx - d.position.x
+                dy = pry - d.position.y
+                dist = math.hypot(dx, dy)
+                vx, vy = d.velocity.x, d.velocity.y
+                spd = math.hypot(vx, vy)
+
+                if dist <= R_CAPTURE_RANGE:
+                    rewards[i] += REWARD_IN_CAPTURE_RING_PER_STEP
+                    rewards[i] += REWARD_SLOW_IN_RING * (
+                        1.0 - min(1.0, spd / DRONE_SPEED)
+                    )
+
+                if dist > max(VELOCITY_TOWARD_MIN_DIST, R_CAPTURE_RANGE):
+                    ux, uy = dx / dist, dy / dist
+                    toward = max(-1.0, min(1.0, (vx * ux + vy * uy) / DRONE_SPEED))
+                    rewards[i] += chase_w * REWARD_VELOCITY_TOWARD_PREY * toward
+
+                edge = min(
+                    d.position.x - x_min,
+                    x_max - d.position.x,
+                    d.position.y - y_min,
+                    y_max - d.position.y,
+                )
+                if edge < BOUNDARY_MARGIN_PENALTY and BOUNDARY_MARGIN_PENALTY > 0:
+                    t = 1.0 - (edge / BOUNDARY_MARGIN_PENALTY)
+                    rewards[i] += PENALTY_BOUNDARY_PROXIMITY * max(0.0, min(1.0, t))
+
+                if edge <= STUCK_EDGE_MARGIN and spd <= STUCK_SPEED_THRESHOLD:
+                    self._edge_stuck_counts[i] += 1
+                else:
+                    self._edge_stuck_counts[i] = 0
+                if self._edge_stuck_counts[i] >= STUCK_STEPS:
+                    stuck_scale = min(
+                        1.0,
+                        self._edge_stuck_counts[i] / max(1, STUCK_STEPS * 2),
+                    )
+                    rewards[i] += PENALTY_STUCK * stuck_scale
+
         for i in range(n):
             if self._obs_collisions[i]:
-                shared += PENALTY_OBSTACLE_COLLISION / n
+                rewards[i] += PENALTY_OBSTACLE_COLLISION
             if self._pred_collisions[i]:
-                shared += PENALTY_PREDATOR_COLLISION / n
+                rewards[i] += PENALTY_PREDATOR_COLLISION
+            if (
+                self.drones[i].velocity.length() < IDLE_SPEED_THRESHOLD
+                and (i >= len(cur_dists) or cur_dists[i] > R_CAPTURE_RANGE)
+            ):
+                rewards[i] += PENALTY_IDLE
 
-        # idle penalty
-        for d in self.drones:
-            if d.velocity.length() < IDLE_SPEED_THRESHOLD:
-                shared += PENALTY_IDLE / n
-
-        rewards = {i: shared for i in range(n)}
-
-        # optional per-agent contributor bonus
         if CONTRIBUTOR_BONUS_ENABLED:
-            for idx in contributor_indices:
+            for idx in capture.contributor_indices:
                 if 0 <= idx < n:
                     rewards[idx] += CONTRIBUTOR_BONUS
 
         return rewards
 
-    def _mean_pred_prey_dist(self) -> float:
+    def _per_drone_prey_dists(self) -> list[float]:
         if self.prey is None or not self.drones:
-            return 0.0
+            return [0.0] * len(self.drones)
         px, py = self.prey.position.x, self.prey.position.y
-        total = sum(math.hypot(d.position.x - px, d.position.y - py) for d in self.drones)
-        return total / len(self.drones)
+        return [math.hypot(d.position.x - px, d.position.y - py) for d in self.drones]
+
+    def formation_role_angle(self, agent_idx: int) -> float:
+        """Stable world-frame ring angle assigned to one predator."""
+        return -math.pi / 2.0 + 2.0 * math.pi * agent_idx / max(1, len(self.drones))
+
+    def formation_target(self, agent_idx: int) -> pygame.math.Vector2:
+        """Current role target, clamped so it remains inside the arena."""
+        if self.prey is None:
+            return self.drones[agent_idx].position.copy()
+        angle = self.formation_role_angle(agent_idx)
+        target = self.prey.position + pygame.math.Vector2(
+            math.cos(angle) * FORMATION_TARGET_RADIUS,
+            math.sin(angle) * FORMATION_TARGET_RADIUS,
+        )
+        x_min, y_min, x_max, y_max = self.arena.get_bounds()
+        margin = DRONE_RADIUS + 1.0
+        target.x = max(x_min + margin, min(x_max - margin, target.x))
+        target.y = max(y_min + margin, min(y_max - margin, target.y))
+        return target
+
+    def _formation_role_errors(self) -> list[float]:
+        return [
+            drone.position.distance_to(self.formation_target(i))
+            for i, drone in enumerate(self.drones)
+        ]
+
+    def _angular_coverage(self) -> float:
+        if self.prey is None or len(self.drones) < 2:
+            return 0.0
+        angles = sorted(
+            math.atan2(
+                drone.position.y - self.prey.position.y,
+                drone.position.x - self.prey.position.x,
+            )
+            % (2.0 * math.pi)
+            for drone in self.drones
+        )
+        gaps = [angles[i + 1] - angles[i] for i in range(len(angles) - 1)]
+        gaps.append(angles[0] + 2.0 * math.pi - angles[-1])
+        return max(0.0, min(1.0, 1.0 - max(gaps) / (2.0 * math.pi)))
 
     # ── observations ──────────────────────────────────────────────────────
 
@@ -436,16 +694,6 @@ class Environment:
         observations: dict[int, np.ndarray] = {}
         x_min, y_min, x_max, y_max = self.arena.get_bounds()
         obs_rects = [o.get_collision_rect() for o in self.obstacles]
-
-        # Team sensing: if any predator is within R_SENSE of prey, all predators
-        # receive full prey-relative features (shared "spotter" information).
-        team_sees_prey = False
-        if self.prey is not None:
-            prx_g, pry_g = self.prey.position.x, self.prey.position.y
-            for d in self.drones:
-                if math.hypot(d.position.x - prx_g, d.position.y - pry_g) <= R_SENSE:
-                    team_sees_prey = True
-                    break
 
         for i, drone in enumerate(self.drones):
             obs = np.zeros(OBS_SIZE, dtype=np.float32)
@@ -459,17 +707,22 @@ class Environment:
             obs[offset + 3] = drone.velocity.y / DRONE_SPEED
             offset += OBS_SELF
 
+            # ---- stable formation role (2) ----
+            role_angle = self.formation_role_angle(i)
+            obs[offset] = math.sin(role_angle)
+            obs[offset + 1] = math.cos(role_angle)
+            offset += OBS_ROLE
+
             # ---- prey (6) ----
             if self.prey is not None:
                 prx, pry = self.prey.position.x, self.prey.position.y
                 dist_prey = math.hypot(prx - px, pry - py)
-                if team_sees_prey:
-                    obs[offset] = 1.0  # prey info available (team spotter within R_SENSE)
-                    obs[offset + 1] = (prx - px) / WORLD_SCALE
-                    obs[offset + 2] = (pry - py) / WORLD_SCALE
-                    obs[offset + 3] = (self.prey.velocity.x - drone.velocity.x) / DRONE_SPEED
-                    obs[offset + 4] = (self.prey.velocity.y - drone.velocity.y) / DRONE_SPEED
-                    obs[offset + 5] = dist_prey / WORLD_SCALE
+                obs[offset] = 1.0
+                obs[offset + 1] = (prx - px) / WORLD_SCALE
+                obs[offset + 2] = (pry - py) / WORLD_SCALE
+                obs[offset + 3] = (self.prey.velocity.x - drone.velocity.x) / DRONE_SPEED
+                obs[offset + 4] = (self.prey.velocity.y - drone.velocity.y) / DRONE_SPEED
+                obs[offset + 5] = dist_prey / WORLD_SCALE
             offset += OBS_PREY
 
             # ---- K teammates (K * 6) ----
@@ -533,6 +786,8 @@ class Environment:
     # ── spawn ─────────────────────────────────────────────────────────────
 
     def _init_obstacles(self) -> None:
+        if not self._obstacles_enabled:
+            return
         for x, y, size_type in OBSTACLE_POSITIONS:
             self.obstacles.append(Obstacle(x, y, size_type))
 
@@ -563,22 +818,51 @@ class Environment:
             )
 
     def _init_prey(self) -> None:
-        prey_speed = PREY_SPEED * self._prey_speed_factor
-        margin = PREY_RADIUS
-        max_attempts = 500
-        for _ in range(max_attempts):
-            x = random.uniform(margin, self._width - margin)
-            y = random.uniform(margin, self._height - margin)
-            pred_pos = [(d.position.x, d.position.y) for d in self.drones]
-            n_in, _ = predators_in_capture_range(x, y, pred_pos, R_CAPTURE_RANGE)
-            w = walls_intersecting_capture_circle(
-                x, y, float(self._width), float(self._height), R_CAPTURE_RANGE,
+        scale = (
+            self._prey_bounce_speed_scale
+            if self._prey_bounce_speed_scale is not None
+            else PREY_BOUNCE_SPEED_SCALE
+        )
+        prey_speed = PREY_SPEED * self._prey_speed_factor * scale
+        x, y = self._spawn_prey_near_arena_center()
+        ang = random.uniform(-math.pi, math.pi)
+        self.prey = Prey(
+            x,
+            y,
+            radius=PREY_RADIUS,
+            speed=prey_speed,
+            vx=prey_speed * math.cos(ang),
+            vy=prey_speed * math.sin(ang),
+        )
+
+    def _spawn_prey_near_arena_center(self) -> tuple[float, float]:
+        """Sample a safe randomized prey position without an initial capture."""
+        r = PREY_RADIUS
+        predator_positions = [
+            (drone.position.x, drone.position.y) for drone in self.drones
+        ]
+        for _ in range(600):
+            x = random.uniform(r, self._width - r)
+            y = random.uniform(r, self._height - r)
+            if not self._is_valid_spawn(x, y, r):
+                continue
+            in_range, _ = predators_in_capture_range(
+                x, y, predator_positions, R_CAPTURE_RANGE
             )
-            nearest = nearest_predator_distance(x, y, pred_pos)
-            if w + n_in < COMBO_CAPTURE_NEED and nearest > R_DANGER * 0.5:
-                self.prey = Prey(x, y, radius=PREY_RADIUS, speed=prey_speed)
-                return
-        self.prey = Prey(self._width / 2, self._height / 2, radius=PREY_RADIUS, speed=prey_speed)
+            wall_count = walls_intersecting_capture_circle(
+                x,
+                y,
+                float(self._width),
+                float(self._height),
+                R_CAPTURE_RANGE,
+            )
+            nearest = nearest_predator_distance(x, y, predator_positions)
+            if (
+                wall_count + in_range < self._combo_capture_need
+                and nearest > R_DANGER * 0.5
+            ):
+                return x, y
+        raise RuntimeError("Could not find valid bounce-prey spawn (try fewer obstacles).")
 
     def _is_valid_spawn(self, x: float, y: float, radius: float) -> bool:
         if x - radius < 0 or x + radius > self._width:

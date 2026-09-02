@@ -2,7 +2,7 @@
 
 A 2D continuous multi-agent pursuit environment with:
 - Learning agents: predator drones
-- Scripted agent: one prey
+- Non-learning prey: bouncing ball (wall reflection)
 - API target: PettingZoo Parallel (`PursuitParallelEnv`)
 - Trainer target: AgileRL
 
@@ -20,43 +20,61 @@ Demo controls (`main.py`):
 - `R`: reset episode
 - `Esc`: quit
 
+### Reliable scripted capture showcase (`showcase_demo.py`)
+
+```bash
+python showcase_demo.py
+```
+
+This runs a deterministic formation controller that predicts the moving prey
+and assigns each predator a different surrounding slot. It uses the real core
+physics, obstacles, and capture rules, but it is explicitly labeled as a
+scripted baseline rather than a learned policy. The default `0.5x` prey speed
+provides reliable captures across randomized layouts.
+
+Controls are `Space` to pause, `R` to reset, and `Esc` to quit. Add
+`--show-targets` to visualize formation assignments or `--no-obstacles` for an
+open arena. Drone and prey positions are randomized on every reset. Pass
+`--seed 7` to get a reproducible sequence of layouts (`7`, `8`, `9`, ...).
+
 ### Trained MATD3 demo (`demo.py`)
 
 Runs pygame with policies loaded from a checkpoint (default: most recent `models/MATD3/*.pt`).
 
 Controls: same as above (`Space`, `R`, `Esc`).
 
-Important: training uses **`action_repeat=4`** on `PursuitParallelEnv` (see `train.py`). The demo repeats each policy action for the same number of physics steps so behavior matches training and motion is stable. Override only if your checkpoint was trained with a different repeat.
+Important: training uses **`action_repeat=2`** on `PursuitParallelEnv` (see `train.py`). The demo repeats each policy action for the same number of physics steps so behavior matches training. Override only if your checkpoint used a different repeat.
 
 CLI (common options):
 
 | Flag | Default | Notes |
 |------|---------|--------|
 | `--checkpoint` | latest in `models/MATD3/` | Path to `.pt` |
-| `--action-repeat` | `4` | Physics steps per policy decision; match `train.py` |
+| `--bc-checkpoint` | none | Preview an actor produced by `pretrain_bc.py` |
+| `--action-repeat` | `2` | Physics steps per policy decision; match `train.py` |
 | `--prey-speed-factor` | `1.0` | Scales prey speed in the env |
+| `--prey-bounce-scale` | config default | Multiplier on bounce prey speed (`PREY_BOUNCE_SPEED_SCALE`) |
 | `--episodes` | `0` | Auto-exit after N completed episodes (`0` = run until closed) |
 
 Example:
 
 ```bash
-python demo.py --checkpoint models/MATD3/MATD3_final_12345.pt --action-repeat 4
+python demo.py --checkpoint models/MATD3/MATD3_best.pt --action-repeat 2
 ```
 
 ## Current Implemented Defaults
 
 Defined in `swarm_env/config.py`:
-- Predators: `DRONE_COUNT = 8`
+- Predators: `DRONE_COUNT = 6`
 - Prey: `1`
 - `r_prey = 2 * r_pred`
-- `v_prey = 1.5 * v_pred`
+- `v_prey = v_pred` at full difficulty
 - `R_SENSE = 8 * r_prey` (team prey sensing / teammate slots)
 - `R_DANGER = 4 * r_prey` (FREE ↔ THREATENED, nearest-predator distance)
 - `R_CAP = 2.5 * r_prey` (legacy base; capture ring is scaled from this)
 - `R_CAPTURE_RANGE = 1.2 * R_CAP` (predators inside this radius count toward capture)
 - `CAPTURE_HOLD_SECONDS = 2.0` → `CAPTURE_HOLD_STEPS = 2 * FPS` (consecutive steps the hold must stay valid)
 - `COMBO_CAPTURE_NEED = 4` (need **walls intersecting blue circle + drones inside `R_CAPTURE_RANGE`** ≥ this to build the hold)
-- `T_HIDE_MAX = 20`
 - `DT = 1 / FPS`, `FPS = 60`
 - `MAX_STEPS = 30 * FPS` (30 seconds)
 
@@ -70,11 +88,10 @@ Defined in `swarm_env/config.py`:
 
 Step order:
 1. Apply predator desired velocities
-2. Scripted prey policy
-3. Physics and collisions
-4. Distance capture check + tactical FSM
-5. Reward computation
-6. Observation assembly
+2. Physics and collisions (prey integrates and bounces on arena edges)
+3. Distance capture check + tactical FSM
+4. Reward computation
+5. Observation assembly
 
 ### Thin PettingZoo adapter
 - File: `swarm_env/parallel_env.py`
@@ -88,6 +105,9 @@ Step order:
 Predators are kinematic agents (`swarm_env/drone.py`):
 - Action: `(vx_desired, vy_desired)`
 - Speed clipping: `||v|| <= DRONE_SPEED`
+- Acceleration clipping: actual velocity approaches the desired velocity by at
+  most `DRONE_MAX_ACCELERATION * DT` per physics step. With the default
+  `320 px/s²`, reaching full speed from rest takes 0.25 seconds.
 - Integration: `position += velocity * DT`
 - Predators cannot pass through walls, obstacles, or other predators
 
@@ -98,19 +118,13 @@ When `actions=None`, the env uses smooth random wandering:
 
 For RL training, always pass explicit actions.
 
-## How Prey Works (Scripted)
+## How Prey Works (Bouncing Ball)
 
 File: `swarm_env/prey.py`
 
-Priority policy:
-1. If threatened: flee **away from the nearest predator** (velocity in the outward radial direction)
-2. If threatened and an obstacle is nearby: may enter obstacle to hide
-3. If hidden: remain hidden up to `T_HIDE_MAX`, then forced exit (flee from nearest predator)
-4. Otherwise: gentle wander away from the predator cluster centroid
-
-Physics rule:
-- Prey can pass through obstacles
-- Prey is clamped by arena borders
+- Spawned near the arena center with a random heading; speed is `PREY_SPEED * prey_speed_factor * PREY_BOUNCE_SPEED_SCALE` (see `config.py`).
+- Not a learning agent: velocity changes only via arena **wall reflection** (`Arena.clamp_and_bounce` in `environment.py`).
+- Prey passes through obstacles; only arena edges reflect.
 
 ## Capture Logic (Distance Ring + Hold)
 
@@ -139,61 +153,56 @@ Global episode state (`EpisodeState`):
 
 Each `step` info dict includes **`capture`**: a **`CaptureStatus`** named tuple `(in_range_count, contributor_indices, hold_counter, wall_count)`.
 
-## Rewards (Shared Team Reward)
+## Rewards
 
-All predators receive the same base team reward per step.
+The environment combines shared capture/chase terms with role-aware local shaping:
 
-Included terms:
-- Terminal:
-  - capture: `+10` (`REWARD_CAPTURE`)
-  - timeout: `-5` (`REWARD_TIMEOUT`)
-- Transitions:
-  - `FREE → THREATENED`: `+0.5` (`REWARD_THREATENED`)
-- Penalties:
-  - obstacle collision: `-0.5` (shared contribution)
-  - predator collision: `-0.2` (shared contribution)
-  - idle penalty: small per-step when speed below `IDLE_SPEED_THRESHOLD`
-- Shaping:
-  - mean predator–prey distance delta, clipped by `DIST_SHAPING_CLIP`
-- Optional:
-  - tiny per-step **`CONTRIBUTOR_BONUS`** for each predator whose center is within **`R_CAPTURE_RANGE`** (if `CONTRIBUTOR_BONUS_ENABLED`)
+- shared terminal capture and timeout rewards;
+- shared progress in mean predator–prey distance and capture-hold progress;
+- per-agent progress toward its assigned formation slot;
+- formation-slot proximity and team angular-coverage bonuses;
+- a chase-direction bonus only while outside the capture ring;
+- collision, idle, boundary, and edge-stall penalties.
+
+The stable role objective allows a shared actor to learn different surrounding
+behavior for each predator instead of sending all drones to the same point.
 
 ## Observation Vector (Per Predator)
 
 Type: fixed-size `np.float32` vector.
 
 Current size:
-- `OBS_SIZE = 64`
+- `OBS_SIZE = 66`
 
 Layout:
 1. Self (4):
    - own pos `(x, y)` normalized by `WORLD_SCALE`
    - own vel `(vx, vy)` normalized by `DRONE_SPEED`
-2. Prey slot (6):
-   - `prey_visible` flag (1 iff **team sensing** is active)
+2. Formation role (2):
+   - `sin(role_angle)`, `cos(role_angle)` for a stable per-agent ring slot
+3. Prey slot (6):
+   - `prey_visible` flag (currently always `1`)
    - relative prey pos
    - relative prey vel
    - prey distance
-   - **Team sensing:** if **any** predator is within `R_SENSE` of the prey, **all** predators get full prey-relative features (shared spotter). If **no** predator is in range, the slot is zeroed (no stale coordinates).
-3. Teammates (`K_TEAMMATES=5`, each 6):
+4. Teammates (`K_TEAMMATES=5`, each 6):
    - valid flag
    - relative pos
    - relative vel
    - distance
    - sorted by distance ascending, then padded
-4. Obstacles (`M_OBSTACLES=4`, each 5):
+5. Obstacles (`M_OBSTACLES=4`, each 5):
    - valid flag
    - relative obstacle center
    - obstacle characteristic radius
    - distance
    - sorted by distance ascending, then padded
-5. Borders (4):
+6. Borders (4):
    - distances to left/right/top/bottom
 
-Sensing rule:
-- **Prey:** at least one predator must be within `R_SENSE` of the prey; then **all** agents get prey-relative features (team broadcast). No stale prey coords when nobody senses prey.
-- **Teammates / obstacles:** radius-only (`distance <= R_SENSE`) from self, as before.
-- No line-of-sight test; obstacles do not block sensing.
+Teammates and obstacles use radius-only sensing (`distance <= R_SENSE`). The
+prey state is globally available so learning focuses on coordination and
+capture rather than exploration.
 
 ## Action Spaces
 
@@ -203,7 +212,7 @@ Sensing rule:
 - Env clips to `DRONE_SPEED`
 
 ### PettingZoo `PursuitParallelEnv`
-- Agents: `predator_0` ... `predator_7`
+- Agents: `predator_0` ... `predator_5` (when `DRONE_COUNT = 6`)
 - `action_space(agent) = Box(low=-DRONE_SPEED, high=DRONE_SPEED, shape=(2,), dtype=float32)`
 - `observation_space(agent) = Box(shape=(OBS_SIZE,), dtype=float32)`
 
@@ -236,19 +245,56 @@ while env.agents:
     obs, rewards, terms, truncs, infos = env.step(actions)
 ```
 
-## AgileRL Integration Notes
+## Learning Pipeline
 
-Use `PursuitParallelEnv` as the training entrypoint.
+The recommended path is expert imitation followed by MATD3 fine-tuning.
 
-Typical setup:
-1. Instantiate `PursuitParallelEnv` (with `action_repeat` aligned across train/eval/demo — default **`4`** in `train.py`)
-2. Call `reset()` for dict observations
-3. Build policy networks from `action_space` / `observation_space`
-4. Train with the shared reward signal (already handled by env)
+1. Collect randomized scripted demonstrations:
 
-Because this env follows PettingZoo Parallel API, it plugs into PettingZoo-compatible AgileRL pipelines directly.
+   ```bash
+   python collect_expert.py --episodes 500 --output data/expert_capture.h5
+   ```
 
-Training script: `train.py` (check `--help` for curriculum, vectorized envs, and other flags). For visual evaluation of a saved policy, use `demo.py` and keep `--action-repeat` consistent with training.
+2. Behavior-clone the shared actor:
+
+   ```bash
+   python pretrain_bc.py \
+     --dataset data/expert_capture.h5 \
+     --output models/BC/formation_actor.pt \
+     --epochs 30
+   ```
+
+3. Measure the cloned policy before RL:
+
+   ```bash
+   python evaluate.py \
+     --bc-checkpoint models/BC/formation_actor.pt \
+     --episodes 100 --prey-speed-factor 0.5
+   ```
+
+4. Fine-tune with the five-stage curriculum:
+
+   ```bash
+   python train.py \
+     --bc-checkpoint models/BC/formation_actor.pt \
+     --max-steps 2000000 --num-envs 4
+   ```
+
+   The curriculum progresses from a stationary prey/open arena to the full
+   moving-prey obstacle task. Captures and timeouts are both terminal replay
+   transitions. `models/MATD3/MATD3_best.pt` is selected by held-out capture
+   rate rather than training reward.
+
+5. Evaluate and display the learned policy:
+
+   ```bash
+   python evaluate.py --checkpoint models/MATD3/MATD3_best.pt --episodes 100
+   python demo.py --checkpoint models/MATD3/MATD3_best.pt
+   ```
+
+Training, evaluation, and the visual demo all default to `action_repeat=2`.
+Changing the observation layout, movement physics, or action repeat invalidates
+older checkpoints.
 
 ## Tests
 
@@ -269,20 +315,24 @@ Coverage:
 - Four drones in the ring, open arena → `CAPTURED` after hold
 - Three drones only, open arena → never `CAPTURED`
 - Three drones + one wall intersecting the blue circle → `CAPTURED` after hold
-- Prey forced exit after `T_HIDE_MAX`
 - PettingZoo `parallel_api_test` and random rollout smoke test
 
 ### Manual layout demo (`demo_manual_spawn_test.py`)
 
-Prey starts at arena center with scripted policy effectively off (`prey_speed_factor=0`); **drones push the prey** via a demo-only `ManualPushDemoEnv` physics pass (overlap resolution + light damping). Three bots are stationary; one drone uses **WASD**. **Capture rules are the same as training** (`COMBO_CAPTURE_NEED`, wall + drone combo). Obstacle-free layout.
+Prey starts at arena center with zero velocity (`prey_speed_factor=0`); **drones push the prey** via a demo-only `ManualPushDemoEnv` physics pass (overlap resolution + light damping). Three bots are stationary; one drone uses **WASD**. **Capture rules are the same as training** (`COMBO_CAPTURE_NEED`, wall + drone combo). Obstacle-free layout.
 
 ## File Map
 
 ```text
 env/
 ├── main.py
+├── showcase_demo.py
 ├── demo.py
 ├── demo_manual_spawn_test.py
+├── collect_expert.py
+├── pretrain_bc.py
+├── evaluate.py
+├── swarm_ml.py
 ├── train.py
 ├── requirements.txt
 ├── tests/
@@ -294,6 +344,7 @@ env/
     ├── arena.py
     ├── obstacle.py
     ├── drone.py
+    ├── formation_controller.py
     ├── prey.py
     ├── capture.py
     ├── environment.py

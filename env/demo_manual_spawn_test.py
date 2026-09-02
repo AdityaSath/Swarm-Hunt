@@ -1,5 +1,5 @@
 """
-Test harness: prey at arena center (scripted policy off — only drones move it),
+Test harness: prey at arena center (velocity zero — only drones move it),
 three static predators beside it, one predator controlled with WASD.
 
 Run from repo root / env folder:
@@ -98,7 +98,6 @@ def apply_test_layout(env: Environment) -> None:
     if env.prey is not None:
         env.prey.position.update(cx, cy)
         env.prey.velocity.update(0.0, 0.0)
-        env.prey.decide = lambda *a, **k: None  # noqa: ARG005
 
     for i in range(STATIC_COUNT):
         ang = i * (2.0 * math.pi / 3.0) - math.pi / 2.0
@@ -119,10 +118,17 @@ def apply_test_layout(env: Environment) -> None:
     env._fsm.reset()
     env._episode_state = EpisodeState.IN_PURSUIT
     env._step_count = 0
-    env._prev_mean_dist = env._mean_pred_prey_dist()
+    env._prev_indiv_dists = env._per_drone_prey_dists()
+    env._prev_mean_prey_dist = (
+        sum(env._prev_indiv_dists) / len(env._prev_indiv_dists)
+        if env._prev_indiv_dists
+        else 0.0
+    )
     env._prev_tactical = PreyTacticalState.FREE
     env._obs_collisions = [False] * len(env.drones)
     env._pred_collisions = [False] * len(env.drones)
+    env._wall_contacts = [False] * len(env.drones)
+    env._edge_stuck_counts = [0] * len(env.drones)
 
 
 def _wasd_velocity(keys) -> tuple[float, float]:
