@@ -31,7 +31,9 @@ from swarm_env.capture import (
     TacticalFSM,
     PreyTacticalState,
     EpisodeState,
+    nearest_predator_distance,
     predators_in_capture_range,
+    walls_intersecting_capture_circle,
 )
 from swarm_env.config import (
     ARENA_WIDTH,
@@ -60,6 +62,12 @@ from swarm_env.config import (
     TEAM_MEAN_PROGRESS_WEIGHT,
     TEAM_CAPTURE_RANGE_WEIGHT,
     TEAM_HOLD_PROGRESS_WEIGHT,
+    FORMATION_TARGET_RADIUS,
+    FORMATION_PROGRESS_CLIP,
+    FORMATION_PROGRESS_WEIGHT,
+    FORMATION_PROXIMITY_RADIUS,
+    FORMATION_PROXIMITY_REWARD,
+    ANGULAR_COVERAGE_REWARD,
     REWARD_VELOCITY_TOWARD_PREY,
     VELOCITY_TOWARD_MIN_DIST,
     CHASE_BOOTSTRAP_STEPS,
@@ -83,20 +91,30 @@ from swarm_env.config import (
     CONTRIBUTOR_BONUS,
     CONTRIBUTOR_BONUS_ENABLED,
     CAPTURE_HOLD_STEPS,
+    COMBO_CAPTURE_NEED,
 )
 
 # Per-predator observation size:
 #   self: pos(2) + vel(2) = 4
+#   role: sin(angle) + cos(angle) = 2
 #   prey: visible(1) + rel_pos(2) + rel_vel(2) + dist(1) = 6
 #   K teammates: each valid(1) + rel_pos(2) + rel_vel(2) + dist(1) = 6  → K*6
 #   M obstacles: each valid(1) + rel_pos(2) + char_radius(1) + dist(1) = 5  → M*5
 #   borders: left, right, top, bottom = 4
 OBS_SELF = 4
+OBS_ROLE = 2
 OBS_PREY = 6
 OBS_TEAMMATE_SLOT = 6
 OBS_OBSTACLE_SLOT = 5
 OBS_BORDER = 4
-OBS_SIZE = OBS_SELF + OBS_PREY + K_TEAMMATES * OBS_TEAMMATE_SLOT + M_OBSTACLES * OBS_OBSTACLE_SLOT + OBS_BORDER
+OBS_SIZE = (
+    OBS_SELF
+    + OBS_ROLE
+    + OBS_PREY
+    + K_TEAMMATES * OBS_TEAMMATE_SLOT
+    + M_OBSTACLES * OBS_OBSTACLE_SLOT
+    + OBS_BORDER
+)
 
 
 # ── collision helpers (pure functions) ────────────────────────────────────
@@ -222,6 +240,9 @@ class Environment:
         seed: int | None = None,
         prey_speed_factor: float = 1.0,
         prey_bounce_speed_scale: float | None = None,
+        obstacles_enabled: bool = True,
+        capture_hold_steps: int = CAPTURE_HOLD_STEPS,
+        combo_capture_need: int = COMBO_CAPTURE_NEED,
     ):
         self.dt = dt
         self._width = width
@@ -229,19 +250,26 @@ class Environment:
         self._drone_count = drone_count
         self._prey_speed_factor = max(0.0, prey_speed_factor)
         self._prey_bounce_speed_scale = prey_bounce_speed_scale
+        self._obstacles_enabled = bool(obstacles_enabled)
+        self._capture_hold_steps = max(1, int(capture_hold_steps))
+        self._combo_capture_need = max(1, int(combo_capture_need))
         self.arena = Arena(width, height)
 
         self.obstacles: list[Obstacle] = []
         self.drones: list[Drone] = []
         self.prey: Prey | None = None
 
-        self._fsm = TacticalFSM()
+        self._fsm = TacticalFSM(
+            capture_hold_steps=self._capture_hold_steps,
+            combo_capture_need=self._combo_capture_need,
+        )
         self._episode_state = EpisodeState.IN_PURSUIT
         self._step_count = 0
 
         # reward bookkeeping
         self._prev_indiv_dists: list[float] = []
         self._prev_mean_prey_dist = 0.0
+        self._prev_role_errors: list[float] = []
         self._prev_tactical: PreyTacticalState = PreyTacticalState.FREE
 
         # per-step collision flags (set during physics, consumed by rewards)
@@ -277,6 +305,7 @@ class Environment:
             if self._prev_indiv_dists
             else 0.0
         )
+        self._prev_role_errors = self._formation_role_errors()
         self._prev_tactical = PreyTacticalState.FREE
         self._obs_collisions = [False] * self._drone_count
         self._pred_collisions = [False] * self._drone_count
@@ -496,7 +525,7 @@ class Environment:
         team_reward += TEAM_CAPTURE_RANGE_WEIGHT * (capture.in_range_count / max(1, n))
         if capture.hold_counter > 0:
             team_reward += TEAM_HOLD_PROGRESS_WEIGHT * (
-                capture.hold_counter / max(1, CAPTURE_HOLD_STEPS)
+                capture.hold_counter / self._capture_hold_steps
             )
 
         for i in range(n):
@@ -504,6 +533,26 @@ class Environment:
 
         self._prev_indiv_dists = cur_dists
         self._prev_mean_prey_dist = mean_dist
+
+        role_errors = self._formation_role_errors()
+        for i, error in enumerate(role_errors):
+            previous = (
+                self._prev_role_errors[i]
+                if i < len(self._prev_role_errors)
+                else error
+            )
+            progress = max(
+                -FORMATION_PROGRESS_CLIP,
+                min(FORMATION_PROGRESS_CLIP, (previous - error) / WORLD_SCALE),
+            )
+            rewards[i] += FORMATION_PROGRESS_WEIGHT * progress
+            proximity = max(0.0, 1.0 - error / FORMATION_PROXIMITY_RADIUS)
+            rewards[i] += FORMATION_PROXIMITY_REWARD * proximity
+        self._prev_role_errors = role_errors
+
+        coverage_reward = ANGULAR_COVERAGE_REWARD * self._angular_coverage()
+        for i in range(n):
+            rewards[i] += coverage_reward
 
         if (
             PENALTY_EDGE_STRAGGLER > 0.0
@@ -549,7 +598,7 @@ class Environment:
                         1.0 - min(1.0, spd / DRONE_SPEED)
                     )
 
-                if dist > VELOCITY_TOWARD_MIN_DIST:
+                if dist > max(VELOCITY_TOWARD_MIN_DIST, R_CAPTURE_RANGE):
                     ux, uy = dx / dist, dy / dist
                     toward = max(-1.0, min(1.0, (vx * ux + vy * uy) / DRONE_SPEED))
                     rewards[i] += chase_w * REWARD_VELOCITY_TOWARD_PREY * toward
@@ -599,6 +648,46 @@ class Environment:
         px, py = self.prey.position.x, self.prey.position.y
         return [math.hypot(d.position.x - px, d.position.y - py) for d in self.drones]
 
+    def formation_role_angle(self, agent_idx: int) -> float:
+        """Stable world-frame ring angle assigned to one predator."""
+        return -math.pi / 2.0 + 2.0 * math.pi * agent_idx / max(1, len(self.drones))
+
+    def formation_target(self, agent_idx: int) -> pygame.math.Vector2:
+        """Current role target, clamped so it remains inside the arena."""
+        if self.prey is None:
+            return self.drones[agent_idx].position.copy()
+        angle = self.formation_role_angle(agent_idx)
+        target = self.prey.position + pygame.math.Vector2(
+            math.cos(angle) * FORMATION_TARGET_RADIUS,
+            math.sin(angle) * FORMATION_TARGET_RADIUS,
+        )
+        x_min, y_min, x_max, y_max = self.arena.get_bounds()
+        margin = DRONE_RADIUS + 1.0
+        target.x = max(x_min + margin, min(x_max - margin, target.x))
+        target.y = max(y_min + margin, min(y_max - margin, target.y))
+        return target
+
+    def _formation_role_errors(self) -> list[float]:
+        return [
+            drone.position.distance_to(self.formation_target(i))
+            for i, drone in enumerate(self.drones)
+        ]
+
+    def _angular_coverage(self) -> float:
+        if self.prey is None or len(self.drones) < 2:
+            return 0.0
+        angles = sorted(
+            math.atan2(
+                drone.position.y - self.prey.position.y,
+                drone.position.x - self.prey.position.x,
+            )
+            % (2.0 * math.pi)
+            for drone in self.drones
+        )
+        gaps = [angles[i + 1] - angles[i] for i in range(len(angles) - 1)]
+        gaps.append(angles[0] + 2.0 * math.pi - angles[-1])
+        return max(0.0, min(1.0, 1.0 - max(gaps) / (2.0 * math.pi)))
+
     # ── observations ──────────────────────────────────────────────────────
 
     def _compute_observations(self) -> dict[int, np.ndarray]:
@@ -617,6 +706,12 @@ class Environment:
             obs[offset + 2] = drone.velocity.x / DRONE_SPEED
             obs[offset + 3] = drone.velocity.y / DRONE_SPEED
             offset += OBS_SELF
+
+            # ---- stable formation role (2) ----
+            role_angle = self.formation_role_angle(i)
+            obs[offset] = math.sin(role_angle)
+            obs[offset + 1] = math.cos(role_angle)
+            offset += OBS_ROLE
 
             # ---- prey (6) ----
             if self.prey is not None:
@@ -691,6 +786,8 @@ class Environment:
     # ── spawn ─────────────────────────────────────────────────────────────
 
     def _init_obstacles(self) -> None:
+        if not self._obstacles_enabled:
+            return
         for x, y, size_type in OBSTACLE_POSITIONS:
             self.obstacles.append(Obstacle(x, y, size_type))
 
@@ -739,29 +836,31 @@ class Environment:
         )
 
     def _spawn_prey_near_arena_center(self) -> tuple[float, float]:
-        """Spawn near arena center on open ground (center may intersect an obstacle)."""
-        cx = self._width / 2
-        cy = self._height / 2
+        """Sample a safe randomized prey position without an initial capture."""
         r = PREY_RADIUS
-        for ring in range(0, 361, 30):
-            if ring == 0:
-                candidates = [(cx, cy)]
-            else:
-                n = max(8, ring // 15)
-                candidates = [
-                    (
-                        cx + ring * math.cos(2 * math.pi * i / n),
-                        cy + ring * math.sin(2 * math.pi * i / n),
-                    )
-                    for i in range(n)
-                ]
-            for x, y in candidates:
-                if self._is_valid_spawn(x, y, r):
-                    return x, y
+        predator_positions = [
+            (drone.position.x, drone.position.y) for drone in self.drones
+        ]
         for _ in range(600):
             x = random.uniform(r, self._width - r)
             y = random.uniform(r, self._height - r)
-            if self._is_valid_spawn(x, y, r):
+            if not self._is_valid_spawn(x, y, r):
+                continue
+            in_range, _ = predators_in_capture_range(
+                x, y, predator_positions, R_CAPTURE_RANGE
+            )
+            wall_count = walls_intersecting_capture_circle(
+                x,
+                y,
+                float(self._width),
+                float(self._height),
+                R_CAPTURE_RANGE,
+            )
+            nearest = nearest_predator_distance(x, y, predator_positions)
+            if (
+                wall_count + in_range < self._combo_capture_need
+                and nearest > R_DANGER * 0.5
+            ):
                 return x, y
         raise RuntimeError("Could not find valid bounce-prey spawn (try fewer obstacles).")
 

@@ -8,3 +8,7 @@ torch>=2.0.1
 agilerl
 tqdm>=4.65.0
 tensorboard
+h5py>=3.10
+
+# Testing
+pytest>=8.0

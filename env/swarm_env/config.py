@@ -20,6 +20,11 @@ MAX_STEPS = 30 * FPS  # episode truncation: 30 s wall-clock at nominal FPS
 DRONE_COUNT = 6
 DRONE_RADIUS = 15
 DRONE_SPEED = 80.0  # v_pred — max speed, clips desired-velocity magnitude
+# Maximum change in velocity per second.  At this value a stationary drone
+# reaches full speed in 0.25 s, while a full-speed reversal takes 0.5 s.
+# Keeping this in the shared physics (rather than smoothing only the renderer)
+# makes training and visual evaluation behave identically.
+DRONE_MAX_ACCELERATION = 320.0
 
 # ---------------------------------------------------------------------------
 # Prey
@@ -44,6 +49,10 @@ CAPTURE_HOLD_SECONDS = 2.0
 CAPTURE_HOLD_STEPS = int(CAPTURE_HOLD_SECONDS * FPS)
 # Capture hold: (walls intersecting blue circle) + (drones inside R_CAPTURE_RANGE) >= this
 COMBO_CAPTURE_NEED = 4
+
+# Stable per-agent formation roles. Agent i owns one evenly spaced point on
+# this ring, exposed as sin/cos(role_angle) in its observation.
+FORMATION_TARGET_RADIUS = 0.72 * R_CAPTURE_RANGE
 
 # ---------------------------------------------------------------------------
 # Tactical FSM (threat proximity only; capture is distance hold above)
@@ -76,6 +85,14 @@ TEAM_MEAN_PROGRESS_CLIP = 0.015
 TEAM_MEAN_PROGRESS_WEIGHT = 22.0
 TEAM_CAPTURE_RANGE_WEIGHT = 0.16
 TEAM_HOLD_PROGRESS_WEIGHT = 0.10
+
+# Role-aware shaping: reward progress toward the assigned formation slot and
+# reward team angular coverage so agents learn to surround rather than bunch.
+FORMATION_PROGRESS_CLIP = 0.015
+FORMATION_PROGRESS_WEIGHT = 18.0
+FORMATION_PROXIMITY_RADIUS = 180.0
+FORMATION_PROXIMITY_REWARD = 0.04
+ANGULAR_COVERAGE_REWARD = 0.05
 
 # Signed pursuit reward: toward-prey velocity is positive, away-from-prey is negative.
 REWARD_VELOCITY_TOWARD_PREY = 0.18
